@@ -131,3 +131,37 @@ def get_logs(tail: int = 500) -> list:
     if len(lines) <= tail:
         return lines
     return lines[-tail:]
+
+
+def start_temp_core(config_path: str, core_type: str) -> "subprocess.Popen":
+    """
+    Start a separate core process with the given config (e.g. for latency test).
+    Does not affect the main core. Caller must terminate the returned process when done.
+    """
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Config not found: {config_path}")
+    if core_type == "xray":
+        cmd = [XRAY_BIN, "run", "-c", config_path]
+    else:
+        cmd = [SINGBOX_BIN, "run", "-c", config_path]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return proc
+
+
+def stop_temp_core(proc: "subprocess.Popen") -> None:
+    """Terminate a process started with start_temp_core."""
+    if proc is None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    except Exception:
+        pass

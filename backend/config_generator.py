@@ -330,6 +330,84 @@ def write_config(config: Dict[str, Any], path: str) -> None:
         json.dump(config, f, indent=2, ensure_ascii=False)
 
 
+# --- Minimal config for latency test: single node, HTTP inbound on temp port, all traffic via proxy ---
+LATENCY_TEST_HTTP_PORT = 19099
+
+
+def build_minimal_singbox_config(outbound_node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
+    """Build a minimal sing-box config with one node and one HTTP inbound. Used for real latency test in a separate process."""
+    if outbound_node.get("params") and _is_singbox_outbound(outbound_node):
+        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
+    elif _is_singbox_outbound(outbound_node):
+        proxy_out = _normalize_singbox_outbound(outbound_node, tag="proxy")
+    else:
+        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
+    if not proxy_out:
+        raise ValueError("Unsupported node type or invalid node.")
+    listen_fields = {"sniff": True, "sniff_override_destination": True}
+    dns_servers = [
+        {"tag": "local_local", "address": "223.5.5.5"},
+        {
+            "tag": "remote_dns",
+            "address": "https://cloudflare-dns.com/dns-query",
+            "detour": "proxy",
+            "address_resolver": "local_local",
+        },
+    ]
+    return {
+        "log": {"level": "warn", "timestamp": True},
+        "dns": {"servers": dns_servers, "final": "remote_dns", "independent_cache": True},
+        "inbounds": [
+            {
+                "type": "http",
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "listen_port": http_port,
+                **listen_fields,
+            },
+        ],
+        "outbounds": [proxy_out, {"type": "direct", "tag": "direct"}],
+        "route": {"rules": [], "final": "proxy"},
+    }
+
+
+def build_minimal_xray_config(outbound_node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
+    """Build a minimal Xray config with one node and one HTTP inbound. Used for real latency test in a separate process."""
+    if _is_singbox_outbound(outbound_node):
+        node = dict(outbound_node)
+        node["type"] = node.get("type")
+        node["server"] = node.get("server")
+        node["add"] = node.get("server")
+        node["port"] = node.get("server_port") or node.get("port")
+        node["server_port"] = node.get("server_port") or node.get("port")
+        node["uuid"] = node.get("uuid") or node.get("id")
+        node["id"] = node.get("uuid") or node.get("id")
+        proxy_out = _parsed_to_xray_outbound(node, tag="proxy")
+    else:
+        proxy_out = _parsed_to_xray_outbound(outbound_node, tag="proxy")
+    if not proxy_out:
+        raise ValueError("Unsupported node type or invalid node.")
+    sniff = {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": http_port,
+                "protocol": "http",
+                "settings": {},
+                "tag": "http-in",
+                "sniffing": sniff,
+            },
+        ],
+        "outbounds": [
+            {"protocol": "freedom", "tag": "direct"},
+            proxy_out,
+        ],
+        "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]},
+    }
+
+
 # --- Xray config (same inbounds: HTTP + SOCKS; routing by domain; outbound from parsed node) ---
 
 

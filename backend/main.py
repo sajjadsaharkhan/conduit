@@ -1,7 +1,10 @@
 """FastAPI app: auth, settings, subscription, nodes, domains, core status. Serves frontend static."""
+import asyncio
 import json
 import os
 import subprocess
+import tempfile
+import time
 from urllib.request import urlopen
 from urllib.error import URLError
 from contextlib import asynccontextmanager
@@ -17,7 +20,10 @@ from latency import check_nodes_latency, select_best_node
 from config_generator import (
     build_singbox_config,
     build_xray_config,
+    build_minimal_singbox_config,
+    build_minimal_xray_config,
     write_config,
+    LATENCY_TEST_HTTP_PORT,
     parsed_to_singbox_outbound,
     SINGBOX_CLASH_API_PORT,
     SINGBOX_CLASH_API_ENV,
@@ -31,6 +37,8 @@ from core_manager import (
     get_xray_config_path,
     get_logs as core_get_logs,
     XRAY_BIN,
+    start_temp_core,
+    stop_temp_core,
 )
 from scheduler import refresh_and_apply, start_scheduler, run_refresh_once
 from latency_test import run_latency_test
@@ -127,8 +135,6 @@ async def _delayed_refresh():
     await asyncio.sleep(5)
     await run_refresh_once()
 
-
-import asyncio
 
 app = FastAPI(title="Conduit API", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -487,12 +493,10 @@ async def node_latency_test(
     body: SelectNodeRequest,
     username: str = Depends(get_current_user),
 ):
-    """Run real latency/speed test for a specific node. Temporarily switches to that node, runs test, restores."""
+    """Run real latency/speed test for a specific node using a separate temp core process. Does not change the current node."""
     raw_link = body.raw_link.strip()
     if not raw_link:
         raise HTTPException(status_code=400, detail="raw_link required")
-    # When node_id is provided (e.g. subscription nodes), load canonical raw_link from DB so apply/update match
-    link_to_apply = raw_link
     async with db_connection() as conn:
         cursor = await conn.cursor()
         if body.node_id is not None:
@@ -502,41 +506,59 @@ async def node_latency_test(
             )
             row = await cursor.fetchone()
             if row and row[0]:
-                link_to_apply = (row[0] or "").strip() or raw_link
-        selected = await _get_setting(cursor, "selected_node_raw", "")
+                raw_link = (row[0] or "").strip() or raw_link
+                parsed = json.loads(row[1]) if row[1] else None
+            else:
+                parsed = None
+        else:
+            parsed = None
+        if not parsed:
+            parsed = parse_share_link(raw_link)
         test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip()
-        http_port = int(await _get_setting(cursor, "http_port", "8080"))
-        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-        proxy_password = await _get_setting(cursor, "proxy_password", "")
+        core_type = await _get_setting(cursor, "core_type", "sing-box")
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Invalid or unknown node")
     if not test_url:
         raise HTTPException(status_code=400, detail="Set a test URL in Core → Latency test and save.")
-    if link_to_apply != selected:
-        try:
-            await _apply_node_config(link_to_apply)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
     try:
-        result = await asyncio.to_thread(
-            run_latency_test, test_url, http_port, proxy_username, proxy_password
-        )
-        # Persist real latency for this node (by id when provided, else by raw_link so subscription nodes are updated reliably)
-        real_ms = result.get("latency_ms") if result.get("success") else None
-        async with db_connection() as conn:
-            cursor = await conn.cursor()
-            if body.node_id is not None:
-                await cursor.execute(
-                    "UPDATE nodes SET real_latency_ms = ? WHERE id = ?",
-                    (real_ms, body.node_id),
-                )
-            else:
-                await cursor.execute(
-                    "UPDATE nodes SET real_latency_ms = ? WHERE raw_link = ?",
-                    (real_ms, raw_link),
-                )
-            await conn.commit()
+        if core_type == "xray":
+            minimal_config = build_minimal_xray_config(parsed, LATENCY_TEST_HTTP_PORT)
+        else:
+            minimal_config = build_minimal_singbox_config(parsed, LATENCY_TEST_HTTP_PORT)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    tmp_path = tmp.name
+    try:
+        json.dump(minimal_config, tmp, indent=2, ensure_ascii=False)
+        tmp.close()
+        proc = await asyncio.to_thread(start_temp_core, tmp_path, core_type)
+        try:
+            await asyncio.sleep(1.5)
+            result = await asyncio.to_thread(
+                run_latency_test, test_url, LATENCY_TEST_HTTP_PORT, "", ""
+            )
+        finally:
+            await asyncio.to_thread(stop_temp_core, proc)
     finally:
-        if link_to_apply != selected and selected:
-            await _apply_node_config(selected)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    real_ms = result.get("latency_ms") if result.get("success") else None
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        if body.node_id is not None:
+            await cursor.execute(
+                "UPDATE nodes SET real_latency_ms = ? WHERE id = ?",
+                (real_ms, body.node_id),
+            )
+        else:
+            await cursor.execute(
+                "UPDATE nodes SET real_latency_ms = ? WHERE raw_link = ?",
+                (real_ms, raw_link),
+            )
+        await conn.commit()
     return result
 
 

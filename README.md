@@ -117,8 +117,8 @@ On push to `main` or `master`, GitHub Actions build the backend and frontend ima
 To use the built images with Docker Compose, set the image names in `docker-compose.yml` or pull manually:
 
 ```bash
-docker pull ghcr.io/<owner>/<repo>/backend:main
-docker pull ghcr.io/<owner>/<repo>/frontend:main
+docker pull ghcr.io/sajjadsaharkhan/conduit/backend:main
+docker pull ghcr.io/sajjadsaharkhan/conduit/frontend:main
 ```
 
 ## Development
