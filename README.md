@@ -202,18 +202,6 @@ Today the app implements the **whitelist** style. The other modes are on the roa
 | `SINGBOX_CONFIG_PATH` | sing-box config path (default: `/data/singbox_config.json`) |
 | `JWT_SECRET` | Secret for auth tokens (optional; auto-generated if unset) |
 | `SINGBOX_CLASH_API` | Set to `1` to enable experimental Clash API for usage stats (if your sing-box build supports it) |
-
----
-
-## 📦 Docker image builds (GitHub Actions)
-
-On push to `main` (or `master`), [GitHub Actions](https://github.com/sajjadsaharkhan/conduit/actions) build backend and frontend for **linux/amd64** and **linux/arm64** and push to [GitHub Container Registry](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry):
-
-- **Backend:** `ghcr.io/sajjadsaharkhan/conduit/backend:main`
-- **Frontend:** `ghcr.io/sajjadsaharkhan/conduit/frontend:main`
-
-Use these with **docker-compose.deploy.yml** for deploy-only (no local build).
-
 ---
 
 ## 📄 License
