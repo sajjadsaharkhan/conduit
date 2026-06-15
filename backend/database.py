@@ -37,6 +37,7 @@ async def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 type TEXT NOT NULL CHECK(type IN ('domain', 'suffix', 'keyword', 'regex', 'exact', 'domain_suffix', 'contains')),
                 value TEXT NOT NULL,
+                outbound TEXT NOT NULL DEFAULT 'proxy' CHECK(outbound IN ('proxy', 'direct')),
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -93,6 +94,14 @@ async def init_db() -> None:
         await cursor.close()
         if not any(r[1] == "real_latency_ms" for r in rows):
             await db.execute("ALTER TABLE nodes ADD COLUMN real_latency_ms INTEGER")
+            await db.commit()
+
+        # Migration: add outbound column to proxy_domains if missing
+        cursor = await db.execute("PRAGMA table_info(proxy_domains)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not any(r[1] == "outbound" for r in rows):
+            await db.execute("ALTER TABLE proxy_domains ADD COLUMN outbound TEXT NOT NULL DEFAULT 'proxy'")
             await db.commit()
 
 

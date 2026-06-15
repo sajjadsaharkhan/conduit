@@ -81,12 +81,14 @@ class SettingUpdate(BaseModel):
 
 
 class DomainCreate(BaseModel):
-    type: str  # domain, suffix, keyword, regex
+    type: str  # domain, suffix, keyword, regex, exact, domain_suffix, contains
     value: str
+    outbound: str = "proxy"  # "proxy" | "direct"
 
 
 class DomainBulkRequest(BaseModel):
     text: str  # newline-separated list: exact domains, *.domain.com → domain_suffix, *keyword* → contains
+    outbound: str = "proxy"  # outbound applied to all imported entries: "proxy" | "direct"
 
 
 class ManualConfigRequest(BaseModel):
@@ -252,7 +254,7 @@ async def update_settings(
             if host:
                 await cursor.execute("SELECT 1 FROM proxy_domains WHERE type = 'domain' AND value = ?", (host,))
                 if await cursor.fetchone() is None:
-                    await cursor.execute("INSERT INTO proxy_domains (type, value) VALUES ('domain', ?)", (host,))
+                    await cursor.execute("INSERT INTO proxy_domains (type, value, outbound) VALUES ('domain', ?, 'proxy')", (host,))
         if body.proxy_display_host is not None:
             val = (body.proxy_display_host or "127.0.0.1").strip() or "127.0.0.1"
             await cursor.execute(
@@ -349,8 +351,8 @@ async def update_node(
             await conn.commit()
         async with db_connection() as conn:
             cursor = await conn.cursor()
-            await cursor.execute("SELECT type, value FROM proxy_domains ORDER BY id")
-            domains = [{"type": r[0], "value": r[1]} for r in await cursor.fetchall()]
+            await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
+            domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
             domains = await _domains_with_latency_test(cursor, domains)
             http_port = int(await _get_setting(cursor, "http_port", "8080"))
             socks_port = int(await _get_setting(cursor, "socks_port", "1080"))
@@ -405,8 +407,8 @@ async def select_node(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
             (body.raw_link,),
         )
-        await cursor.execute("SELECT type, value FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1]} for r in await cursor.fetchall()]
+        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
+        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
         domains = await _domains_with_latency_test(cursor, domains)
         http_port = await _get_setting(cursor, "http_port", "8080")
         socks_port = await _get_setting(cursor, "socks_port", "1080")
@@ -441,7 +443,7 @@ async def _domains_with_latency_test(cursor, domains: list) -> list:
         return domains
     if any((d.get("value") or "").strip() == host for d in domains):
         return domains
-    return domains + [{"type": "domain", "value": host}]
+    return domains + [{"type": "domain", "value": host, "outbound": "proxy"}]
 
 
 async def _apply_node_config(raw_link: str) -> None:
@@ -458,8 +460,8 @@ async def _apply_node_config(raw_link: str) -> None:
             parsed = parse_share_link(raw_link)
             if not parsed:
                 raise ValueError("Invalid or unknown node")
-        await cursor.execute("SELECT type, value FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1]} for r in await cursor.fetchall()]
+        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
+        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
         domains = await _domains_with_latency_test(cursor, domains)
         http_port = int(await _get_setting(cursor, "http_port", "8080"))
         socks_port = int(await _get_setting(cursor, "socks_port", "1080"))
@@ -567,9 +569,9 @@ async def node_latency_test(
 async def list_domains(username: str = Depends(get_current_user)):
     async with db_connection() as conn:
         cursor = await conn.cursor()
-        await cursor.execute("SELECT id, type, value FROM proxy_domains ORDER BY id")
+        await cursor.execute("SELECT id, type, value, outbound FROM proxy_domains ORDER BY id")
         rows = await cursor.fetchall()
-    return {"domains": [{"id": r[0], "type": r[1], "value": r[2]} for r in rows]}
+    return {"domains": [{"id": r[0], "type": r[1], "value": r[2], "outbound": r[3]} for r in rows]}
 
 
 @app.post("/api/domains")
@@ -579,21 +581,23 @@ async def add_domain(
 ):
     if body.type not in ("domain", "suffix", "keyword", "regex", "exact", "domain_suffix", "contains"):
         raise HTTPException(status_code=400, detail="Invalid type")
+    if body.outbound not in ("proxy", "direct"):
+        raise HTTPException(status_code=400, detail="outbound must be 'proxy' or 'direct'")
     value = (body.value or "").strip()
     if not value:
         raise HTTPException(status_code=400, detail="Value is required")
     async with db_connection() as conn:
         cursor = await conn.cursor()
         await cursor.execute(
-            "INSERT INTO proxy_domains (type, value) VALUES (?, ?)",
-            (body.type, value),
+            "INSERT INTO proxy_domains (type, value, outbound) VALUES (?, ?, ?)",
+            (body.type, value, body.outbound),
         )
         await cursor.execute("SELECT last_insert_rowid()")
         row = await cursor.fetchone()
         rid = int(row[0]) if row else 0
         await conn.commit()
     await _reapply_config_if_node_selected()
-    return {"id": rid, "type": body.type, "value": value}
+    return {"id": rid, "type": body.type, "value": value, "outbound": body.outbound}
 
 
 @app.delete("/api/domains/{domain_id}")
@@ -630,6 +634,8 @@ async def bulk_add_domains(
     username: str = Depends(get_current_user),
 ):
     """Import newline-separated list. Lines: exact domains, *.domain → domain_suffix, *word* → contains."""
+    if body.outbound not in ("proxy", "direct"):
+        raise HTTPException(status_code=400, detail="outbound must be 'proxy' or 'direct'")
     pairs = []
     for line in body.text.splitlines():
         parsed = _parse_domain_line(line)
@@ -646,8 +652,8 @@ async def bulk_add_domains(
         cursor = await conn.cursor()
         for type_, value in pairs:
             await cursor.execute(
-                "INSERT INTO proxy_domains (type, value) VALUES (?, ?)",
-                (type_, value),
+                "INSERT INTO proxy_domains (type, value, outbound) VALUES (?, ?, ?)",
+                (type_, value, body.outbound),
             )
         await conn.commit()
     await _reapply_config_if_node_selected()
@@ -693,8 +699,8 @@ async def apply_manual_config(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
             (raw_link,),
         )
-        await cursor.execute("SELECT type, value FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1]} for r in await cursor.fetchall()]
+        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
+        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
         domains = await _domains_with_latency_test(cursor, domains)
         http_port = await _get_setting(cursor, "http_port", "8080")
         socks_port = await _get_setting(cursor, "socks_port", "1080")

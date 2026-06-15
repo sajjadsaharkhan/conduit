@@ -228,15 +228,16 @@ def build_singbox_config(
         rule_type = d.get("type", "domain")
         value = d.get("value", "").strip()
         value_lower = value.lower()
+        outbound_tag = d.get("outbound", "proxy")
         if not value:
             continue
-        rule = {"action": "route", "outbound": "proxy"}
+        rule = {"action": "route", "outbound": outbound_tag}
         if rule_type == "exact":
             rule["domain"] = [value_lower]
         elif rule_type == "domain_suffix":
             # Domain + subdomains: match apex domain exactly and all subdomains via suffix
             suffix = value_lower if value_lower.startswith(".") else f".{value_lower}"
-            rules.append({"action": "route", "outbound": "proxy", "domain": [value_lower]})
+            rules.append({"action": "route", "outbound": outbound_tag, "domain": [value_lower]})
             rule["domain_suffix"] = [suffix]
         elif rule_type == "contains":
             rule["domain_keyword"] = [value_lower]
@@ -244,7 +245,7 @@ def build_singbox_config(
             rule["domain_regex"] = [value]
         elif rule_type == "domain":
             rule["domain"] = [value_lower]
-            rules.append({"action": "route", "outbound": "proxy", "domain_suffix": [f".{value_lower}"]})
+            rules.append({"action": "route", "outbound": outbound_tag, "domain_suffix": [f".{value_lower}"]})
         elif rule_type == "suffix":
             rule["domain_suffix"] = [value_lower if value_lower.startswith(".") else f".{value_lower}"]
         elif rule_type == "keyword":
@@ -588,26 +589,27 @@ def build_xray_config(
         rule_type = d.get("type", "domain")
         value = (d.get("value") or "").strip()
         value_lower = value.lower()
+        outbound_tag = d.get("outbound", "proxy")
         if not value:
             continue
         if rule_type == "exact":
-            rules.append({"type": "field", "domain": [f"full:{value_lower}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"full:{value_lower}"], "outboundTag": outbound_tag})
         elif rule_type == "domain_suffix":
             suffix = value_lower.lstrip(".") or value_lower
-            rules.append({"type": "field", "domain": [f"domain:{suffix}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"domain:{suffix}"], "outboundTag": outbound_tag})
         elif rule_type == "contains":
-            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": outbound_tag})
         elif rule_type == "regex":
-            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": outbound_tag})
         elif rule_type == "domain":
-            rules.append({"type": "field", "domain": [f"domain:{value_lower}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"domain:{value_lower}"], "outboundTag": outbound_tag})
         elif rule_type == "suffix":
             suffix = value_lower if value_lower.startswith(".") else f".{value_lower}"
-            rules.append({"type": "field", "domain": [f"domain:{suffix.lstrip('.')}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"domain:{suffix.lstrip('.')}"], "outboundTag": outbound_tag})
         elif rule_type == "keyword":
-            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": outbound_tag})
         else:
-            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": "proxy"})
+            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": outbound_tag})
 
     # Explicit catch-all: send everything that did not match to direct (default first-outbound is direct, but this makes it explicit)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})

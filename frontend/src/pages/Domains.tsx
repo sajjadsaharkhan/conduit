@@ -28,14 +28,17 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
+import { cn } from '@/lib/utils'
 
-type Domain = { id: number; type: string; value: string }
+type Domain = { id: number; type: string; value: string; outbound: string }
+
 const DOMAIN_TYPES = [
   { value: 'exact', label: 'Exact (domain exact match)' },
   { value: 'domain_suffix', label: 'Domain + all subdomains' },
   { value: 'contains', label: 'Contains (keyword → domains containing)' },
   { value: 'regex', label: 'Regex (xray/sing-box valid)' },
 ] as const
+
 const TYPE_LABELS: Record<string, string> = {
   exact: 'Exact',
   domain_suffix: 'Domain + subdomains',
@@ -46,17 +49,35 @@ const TYPE_LABELS: Record<string, string> = {
   keyword: 'Keyword',
 }
 
+function OutboundBadge({ outbound }: { outbound: string }) {
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium',
+        outbound === 'proxy'
+          ? 'bg-primary/15 text-primary'
+          : 'bg-muted text-muted-foreground'
+      )}
+    >
+      {outbound === 'proxy' ? 'Proxy' : 'Direct'}
+    </span>
+  )
+}
+
 export default function Domains() {
   const [list, setList] = useState<Domain[]>([])
   const [loading, setLoading] = useState(true)
   const [addType, setAddType] = useState<string>(DOMAIN_TYPES[0].value)
   const [addValue, setAddValue] = useState('')
+  const [addOutbound, setAddOutbound] = useState<string>('proxy')
   const [adding, setAdding] = useState(false)
   const [deleting, setDeleting] = useState<number | null>(null)
   const [deleteModal, setDeleteModal] = useState<{ id: number; value: string } | null>(null)
   const [message, setMessage] = useState<string | null>(null)
+  const [messageSuccess, setMessageSuccess] = useState(false)
   const [importOpen, setImportOpen] = useState(false)
   const [importText, setImportText] = useState('')
+  const [importOutbound, setImportOutbound] = useState<string>('proxy')
   const [importSubmitting, setImportSubmitting] = useState(false)
 
   function load() {
@@ -73,12 +94,14 @@ export default function Domains() {
     setAdding(true)
     setMessage(null)
     try {
-      await domainsApi.add(addType as string, addValue.trim())
+      await domainsApi.add(addType as string, addValue.trim(), addOutbound)
       setAddValue('')
       load()
-      setMessage('Domain added.')
+      setMessage('Domain rule added.')
+      setMessageSuccess(true)
     } catch (e) {
       setMessage(e instanceof Error ? e.message : 'Failed')
+      setMessageSuccess(false)
     } finally {
       setAdding(false)
     }
@@ -101,13 +124,16 @@ export default function Domains() {
     setImportSubmitting(true)
     setMessage(null)
     try {
-      const res = await domainsApi.bulk(importText)
+      const res = await domainsApi.bulk(importText, importOutbound)
       setMessage(res.message ?? `Added ${res.added} domain rule(s).`)
+      setMessageSuccess(true)
       setImportOpen(false)
       setImportText('')
+      setImportOutbound('proxy')
       load()
     } catch (e) {
       setMessage(e instanceof Error ? e.message : 'Import failed')
+      setMessageSuccess(false)
     } finally {
       setImportSubmitting(false)
     }
@@ -121,17 +147,20 @@ export default function Domains() {
     )
   }
 
+  const proxyRules = list.filter((d) => d.outbound === 'proxy')
+  const directRules = list.filter((d) => d.outbound === 'direct')
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Proxy domains</h1>
         <p className="text-muted-foreground">
-          Only traffic to these domains uses the proxy. All other traffic goes direct.
+          Route domains through the proxy or directly. Everything else goes direct by default.
         </p>
       </div>
 
       {message && (
-        <Alert variant={message.startsWith('Domain added') ? 'success' : 'destructive'}>
+        <Alert variant={messageSuccess ? 'success' : 'destructive'}>
           <AlertDescription>{message}</AlertDescription>
         </Alert>
       )}
@@ -139,7 +168,7 @@ export default function Domains() {
       <Card>
         <CardHeader>
           <CardTitle>Add domain</CardTitle>
-          <CardDescription>Exact match, domain + subdomains, contains keyword, or regex</CardDescription>
+          <CardDescription>Exact match, domain + subdomains, contains keyword, or regex — choose proxy or direct outbound</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={handleAdd} className="flex flex-wrap items-end gap-4">
@@ -168,6 +197,18 @@ export default function Domains() {
                 placeholder={addType === 'regex' ? 'e.g. \\.google\\.com$' : 'e.g. google.com or keyword'}
               />
             </div>
+            <div className="space-y-2">
+              <Label>Outbound</Label>
+              <Select value={addOutbound} onValueChange={setAddOutbound}>
+                <SelectTrigger className="w-[120px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="proxy">Proxy</SelectItem>
+                  <SelectItem value="direct">Direct</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
             <Button type="submit" disabled={adding || !addValue.trim()}>
               {adding ? '…' : 'Add'}
             </Button>
@@ -179,7 +220,14 @@ export default function Domains() {
         <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
           <div>
             <CardTitle>Domain list</CardTitle>
-            <CardDescription>Rules that use the proxy</CardDescription>
+            <CardDescription>
+              <span className="inline-flex items-center gap-1">
+                <span className="inline-flex items-center rounded-full bg-primary/15 text-primary px-2 py-0.5 text-xs font-medium">Proxy</span>
+                rules go through the tunnel ·
+                <span className="inline-flex items-center rounded-full bg-muted text-muted-foreground px-2 py-0.5 text-xs font-medium">Direct</span>
+                rules bypass it
+              </span>
+            </CardDescription>
           </div>
           <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
             Import list
@@ -190,6 +238,7 @@ export default function Domains() {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead>Outbound</TableHead>
                   <TableHead>Type</TableHead>
                   <TableHead>Value</TableHead>
                   <TableHead className="w-[100px]">Actions</TableHead>
@@ -198,27 +247,63 @@ export default function Domains() {
               <TableBody>
                 {list.length === 0 && (
                   <TableRow>
-                    <TableCell colSpan={3} className="text-center text-muted-foreground">
+                    <TableCell colSpan={4} className="text-center text-muted-foreground">
                       No domains. Add one above or import a list.
                     </TableCell>
                   </TableRow>
                 )}
-                {list.map((d) => (
-                  <TableRow key={d.id}>
-                    <TableCell className="font-medium">{TYPE_LABELS[d.type] ?? d.type}</TableCell>
-                    <TableCell className="font-mono text-sm">{d.value}</TableCell>
-                    <TableCell>
-                      <Button
-                        size="sm"
-                        variant="destructive"
-                        onClick={() => setDeleteModal({ id: d.id, value: d.value })}
-                        disabled={deleting !== null}
-                      >
-                        {deleting === d.id ? '…' : 'Remove'}
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {proxyRules.length > 0 && (
+                  <>
+                    <TableRow className="bg-muted/40 hover:bg-muted/40">
+                      <TableCell colSpan={4} className="py-1.5 text-xs font-medium text-muted-foreground">
+                        Proxy rules ({proxyRules.length})
+                      </TableCell>
+                    </TableRow>
+                    {proxyRules.map((d) => (
+                      <TableRow key={d.id}>
+                        <TableCell><OutboundBadge outbound={d.outbound} /></TableCell>
+                        <TableCell className="font-medium">{TYPE_LABELS[d.type] ?? d.type}</TableCell>
+                        <TableCell className="font-mono text-sm">{d.value}</TableCell>
+                        <TableCell>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={() => setDeleteModal({ id: d.id, value: d.value })}
+                            disabled={deleting !== null}
+                          >
+                            {deleting === d.id ? '…' : 'Remove'}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </>
+                )}
+                {directRules.length > 0 && (
+                  <>
+                    <TableRow className="bg-muted/40 hover:bg-muted/40">
+                      <TableCell colSpan={4} className="py-1.5 text-xs font-medium text-muted-foreground">
+                        Direct rules ({directRules.length})
+                      </TableCell>
+                    </TableRow>
+                    {directRules.map((d) => (
+                      <TableRow key={d.id}>
+                        <TableCell><OutboundBadge outbound={d.outbound} /></TableCell>
+                        <TableCell className="font-medium">{TYPE_LABELS[d.type] ?? d.type}</TableCell>
+                        <TableCell className="font-mono text-sm">{d.value}</TableCell>
+                        <TableCell>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={() => setDeleteModal({ id: d.id, value: d.value })}
+                            disabled={deleting !== null}
+                          >
+                            {deleting === d.id ? '…' : 'Remove'}
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </>
+                )}
               </TableBody>
             </Table>
           </div>
@@ -255,10 +340,10 @@ export default function Domains() {
           <DialogHeader>
             <DialogTitle>Import domain list</DialogTitle>
             <DialogDescription>
-              Paste one entry per line. Plain lines (e.g. localhost, meet.google.com) → exact match. Lines starting with *. (e.g. *.google.com) → domain + subdomains. Lines like *keyword* → contains that keyword. Empty lines and # comments are ignored.
+              Paste one entry per line. Plain lines (e.g. meet.google.com) → exact match. Lines starting with *. (e.g. *.google.com) → domain + subdomains. Lines like *keyword* → contains that keyword. Empty lines and # comments are ignored.
             </DialogDescription>
           </DialogHeader>
-          <form onSubmit={handleBulkImport} className="flex flex-col flex-1 min-h-0">
+          <form onSubmit={handleBulkImport} className="flex flex-col flex-1 min-h-0 gap-4">
             <textarea
               className="flex-1 min-h-[280px] w-full rounded-md border border-border bg-background px-3 py-2 text-sm font-mono resize-y"
               value={importText}
@@ -266,7 +351,19 @@ export default function Domains() {
               placeholder={'127.0.0.1\nlocalhost\nmeet.google.com\n*.google.com\n*digikala*\n…'}
               spellCheck={false}
             />
-            <DialogFooter className="mt-4">
+            <div className="flex items-center gap-3">
+              <Label className="shrink-0">Outbound for all imported rules</Label>
+              <Select value={importOutbound} onValueChange={setImportOutbound}>
+                <SelectTrigger className="w-[140px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="proxy">Proxy</SelectItem>
+                  <SelectItem value="direct">Direct</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setImportOpen(false)}>
                 Cancel
               </Button>

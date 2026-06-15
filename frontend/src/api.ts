@@ -113,18 +113,18 @@ export const nodes = {
 
 export const domains = {
   list: () =>
-    api<{ domains: { id: number; type: string; value: string }[] }>('/api/domains'),
-  add: (type: string, value: string) =>
-    api<{ id: number; type: string; value: string }>('/api/domains', {
+    api<{ domains: { id: number; type: string; value: string; outbound: string }[] }>('/api/domains'),
+  add: (type: string, value: string, outbound: string = 'proxy') =>
+    api<{ id: number; type: string; value: string; outbound: string }>('/api/domains', {
       method: 'POST',
-      body: JSON.stringify({ type, value }),
+      body: JSON.stringify({ type, value, outbound }),
     }),
   delete: (id: number) =>
     api<{ ok: boolean }>(`/api/domains/${id}`, { method: 'DELETE' }),
-  bulk: (text: string) =>
+  bulk: (text: string, outbound: string = 'proxy') =>
     api<{ added: number; message: string }>('/api/domains/bulk', {
       method: 'POST',
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text, outbound }),
     }),
 }
 
