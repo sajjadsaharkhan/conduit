@@ -7,7 +7,6 @@ import Proxy from './pages/Proxy'
 import Domains from './pages/Domains'
 import Settings from './pages/Settings'
 import Core from './pages/Core'
-import Configs from './pages/Configs'
 
 function PrivateRoute() {
   const token = localStorage.getItem('token')
@@ -26,7 +25,6 @@ function AuthenticatedApp() {
             <Route path="proxy" element={<Proxy />} />
             <Route path="domains" element={<Domains />} />
             <Route path="core" element={<Core />} />
-            <Route path="configs" element={<Configs />} />
             <Route path="settings" element={<Settings />} />
           </Route>
         </Route>

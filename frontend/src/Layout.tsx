@@ -11,7 +11,6 @@ import {
   Globe,
   Settings,
   LogOut,
-  FileCode,
 } from 'lucide-react'
 
 export default function Layout() {
@@ -41,7 +40,6 @@ export default function Layout() {
     { to: '/proxy', label: 'Proxy', icon: Link2 },
     { to: '/domains', label: 'Domains', icon: Globe },
     { to: '/core', label: 'Core', icon: Server },
-    { to: '/configs', label: 'Core Configs', icon: FileCode },
     { to: '/settings', label: 'Settings', icon: Settings },
   ]
 
