@@ -53,7 +53,7 @@ interface JsonEditorProps {
 export function JsonEditor({
   value,
   onChange,
-  placeholder = '',
+  placeholder: _placeholder = '',
   disabled = false,
   className,
 }: JsonEditorProps) {
