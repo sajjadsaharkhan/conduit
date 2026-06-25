@@ -57,7 +57,7 @@ export function JsonEditor({
   disabled = false,
   className,
 }: JsonEditorProps) {
-  const handleEditorDidMount = (editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) => {
+  const handleEditorDidMount = (_editor: Monaco.editor.IStandaloneCodeEditor, monaco: typeof Monaco) => {
     defineCustomTheme(monaco)
     monaco.editor.setTheme('conduit-dark')
   }

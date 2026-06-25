@@ -142,6 +142,11 @@ export const nodes = {
       size_bytes: number
       success: boolean
       error: string | null
+      status_code: number | null
+      headers: Record<string, string>
+      response_preview: string
+      proxy_used: string
+      has_proxy_auth: boolean
     }>('/api/nodes/latency-test', {
       method: 'POST',
       body: JSON.stringify({ raw_link, node_id: node_id ?? undefined }),
@@ -211,6 +216,11 @@ export const core = {
       size_bytes: number
       success: boolean
       error: string | null
+      status_code: number | null
+      headers: Record<string, string>
+      response_preview: string
+      proxy_used: string
+      has_proxy_auth: boolean
     }>('/api/core/latency-test', {
       method: 'POST',
       body: JSON.stringify({ url: url || undefined }),

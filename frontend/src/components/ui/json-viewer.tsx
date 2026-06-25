@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { ChevronRight, ChevronDown, Braces, List, Quote, Hash, CheckCircle2, XCircle, Plus, Minus } from 'lucide-react'
+import { ChevronRight, ChevronDown, Plus, Minus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 type JsonValue = string | number | boolean | null | JsonArray | JsonObject
@@ -15,16 +15,6 @@ interface JsonTreeNodeProps {
   setExpandedState: React.Dispatch<React.SetStateAction<Set<string>>>
   globalExpand?: boolean | null
   globalCollapse?: boolean | null
-}
-
-function getValueIcon(value: JsonValue) {
-  if (value === null) return <XCircle className="h-3.5 w-3.5 text-muted-foreground" />
-  if (typeof value === 'boolean') return <CheckCircle2 className="h-3.5 w-3.5 text-blue-500" />
-  if (typeof value === 'number') return <Hash className="h-3.5 w-3.5 text-green-500" />
-  if (typeof value === 'string') return <Quote className="h-3.5 w-3.5 text-orange-500" />
-  if (Array.isArray(value)) return <List className="h-3.5 w-3.5 text-purple-500" />
-  if (typeof value === 'object') return <Braces className="h-3.5 w-3.5 text-yellow-500" />
-  return null
 }
 
 function getValueClass(value: JsonValue) {
@@ -43,11 +33,6 @@ function formatValue(value: JsonValue): string {
 
 function generatePath(keyName: string | undefined, parentPath: string): string {
   return parentPath ? `${parentPath}.${keyName || ''}` : (keyName || '')
-}
-
-interface TreeNodeData {
-  path: string
-  expanded: boolean
 }
 
 function JsonTreeNode({ data, keyName, level = 0, isLast = false, expandedState, setExpandedState, globalExpand, globalCollapse }: JsonTreeNodeProps) {
@@ -148,7 +133,7 @@ function JsonTreeNode({ data, keyName, level = 0, isLast = false, expandedState,
           {keys.map((key, index) => (
             <JsonTreeNode
               key={key}
-              data={data[key]}
+              data={(data as JsonObject)[key]}
               keyName={isArray ? undefined : key}
               level={level + 1}
               isLast={index === length - 1}
@@ -168,12 +153,11 @@ interface JsonViewerProps {
   data: JsonValue | null
   loading?: boolean
   error?: string
-  onReload?: () => void
   className?: string
   showControls?: boolean
 }
 
-export function JsonViewer({ data, loading, error, onReload, className, showControls = true }: JsonViewerProps) {
+export function JsonViewer({ data, loading, error, className, showControls = true }: JsonViewerProps) {
   const [expandedState, setExpandedState] = useState<Set<string>>(new Set())
   const [globalExpand, setGlobalExpand] = useState<boolean | null>(null)
   const [globalCollapse, setGlobalCollapse] = useState<boolean | null>(null)
