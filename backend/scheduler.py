@@ -26,14 +26,14 @@ async def _get_setting(cursor, key: str, default: str = "") -> str:
 
 
 async def _get_proxy_domains(cursor) -> list:
-    await cursor.execute("SELECT type, value FROM proxy_domains ORDER BY id")
+    await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
     rows = await cursor.fetchall()
-    domains = [{"type": r[0], "value": r[1]} for r in rows]
+    domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in rows]
     # Include latency test domain so latency test goes through proxy
     test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip()
     host = host_from_url(test_url) if test_url else None
     if host and not any((d.get("value") or "").strip() == host for d in domains):
-        domains = domains + [{"type": "domain", "value": host}]
+        domains = domains + [{"type": "domain", "value": host, "outbound": "proxy"}]
     return domains
 
 

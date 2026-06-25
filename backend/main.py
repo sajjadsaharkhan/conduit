@@ -27,6 +27,7 @@ from config_generator import (
     parsed_to_singbox_outbound,
     SINGBOX_CLASH_API_PORT,
     SINGBOX_CLASH_API_ENV,
+    _parsed_to_xray_outbound as parsed_to_xray_outbound,
 )
 from core_manager import (
     start as core_start,
@@ -43,6 +44,9 @@ from core_manager import (
 from scheduler import refresh_and_apply, start_scheduler, run_refresh_once
 from latency_test import run_latency_test
 from url_utils import host_from_url
+from config_file_manager import ConfigFileManager
+from default_config import get_default_config, get_default_singbox_config, get_default_xray_config
+from migration import migrate_db_to_config
 
 
 # --- Auth dependency ---
@@ -54,6 +58,13 @@ async def get_current_user(authorization: str | None = Header(None)) -> str:
     if not username:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return username
+
+
+# --- Config management ---
+def get_config_manager(core_type: str):
+    """Get config file manager for the current core type."""
+    config_path = get_xray_config_path() if core_type == "xray" else get_config_path()
+    return ConfigFileManager(config_path)
 
 
 # --- Pydantic models ---
@@ -69,12 +80,10 @@ class ChangePasswordRequest(BaseModel):
 
 class SettingUpdate(BaseModel):
     subscription_url: str | None = None
-    http_port: int | None = None
-    socks_port: int | None = None
     core_type: str | None = None  # "sing-box" | "xray"
     refresh_interval_minutes: int | None = None  # 1–1440
     auto_switch_best: bool | None = None
-    latency_test_domain: str | None = None  # e.g. "https://example.com" or "http://example.com/file.txt"
+    latency_test_domain: str | None = None  # e.g. "https://example.com"
     proxy_display_host: str | None = None  # host/IP shown in Dashboard "How to use the proxy" (display only)
     proxy_username: str | None = None  # optional auth for HTTP/SOCKS proxy (empty = no auth)
     proxy_password: str | None = None  # optional auth for HTTP/SOCKS proxy
@@ -124,6 +133,10 @@ async def lifespan(app: FastAPI):
                 (default_user, h),
             )
             await cur.commit()
+
+    # Run one-time migration from DB to config file
+    await migrate_db_to_config()
+
     start_scheduler()
     # Run first refresh after a short delay
     import asyncio
@@ -163,6 +176,7 @@ async def me(username: str = Depends(get_current_user)):
 # --- Settings ---
 @app.get("/api/settings")
 async def get_settings(username: str = Depends(get_current_user)):
+    """Get panel settings from database. Core config is managed via /api/config."""
     async with db_connection() as conn:
         cursor = await conn.cursor()
         await cursor.execute("SELECT key, value FROM settings")
@@ -170,8 +184,6 @@ async def get_settings(username: str = Depends(get_current_user)):
     settings = {r[0]: r[1] for r in rows}
     return {
         "subscription_url": settings.get("subscription_url", ""),
-        "http_port": int(settings.get("http_port", "8080")),
-        "socks_port": int(settings.get("socks_port", "1080")),
         "core_type": settings.get("core_type", "sing-box"),
         "last_refresh": settings.get("last_refresh", ""),
         "selected_node_raw": settings.get("selected_node_raw", ""),
@@ -208,22 +220,13 @@ async def update_settings(
     body: SettingUpdate,
     username: str = Depends(get_current_user),
 ):
+    """Update panel settings in database. Core config is managed via /api/config endpoints."""
     async with db_connection() as conn:
         cursor = await conn.cursor()
         if body.subscription_url is not None:
             await cursor.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('subscription_url', ?)",
                 (body.subscription_url,),
-            )
-        if body.http_port is not None:
-            await cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('http_port', ?)",
-                (str(body.http_port),),
-            )
-        if body.socks_port is not None:
-            await cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('socks_port', ?)",
-                (str(body.socks_port),),
             )
         if body.core_type is not None:
             if body.core_type not in ("sing-box", "xray"):
@@ -249,12 +252,6 @@ async def update_settings(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('latency_test_domain', ?)",
                 (val,),
             )
-            # Automatically add latency test host to domain list so it appears in Domains and routes through proxy
-            host = host_from_url(val)
-            if host:
-                await cursor.execute("SELECT 1 FROM proxy_domains WHERE type = 'domain' AND value = ?", (host,))
-                if await cursor.fetchone() is None:
-                    await cursor.execute("INSERT INTO proxy_domains (type, value, outbound) VALUES ('domain', ?, 'proxy')", (host,))
         if body.proxy_display_host is not None:
             val = (body.proxy_display_host or "127.0.0.1").strip() or "127.0.0.1"
             await cursor.execute(
@@ -349,24 +346,8 @@ async def update_node(
                 (raw_link,),
             )
             await conn.commit()
-        async with db_connection() as conn:
-            cursor = await conn.cursor()
-            await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
-            domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
-            domains = await _domains_with_latency_test(cursor, domains)
-            http_port = int(await _get_setting(cursor, "http_port", "8080"))
-            socks_port = int(await _get_setting(cursor, "socks_port", "1080"))
-            core_type = await _get_setting(cursor, "core_type", "sing-box")
-            proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-            proxy_password = await _get_setting(cursor, "proxy_password", "")
-        if core_type == "xray":
-            config = build_xray_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-            config_path = get_xray_config_path()
-        else:
-            config = build_singbox_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-            config_path = get_config_path()
-        write_config(config, config_path)
-        core_start(config_path, core_type)
+        # Update the config file with the new node
+        await _apply_node_config(raw_link)
     return {"ok": True}
 
 
@@ -407,25 +388,9 @@ async def select_node(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
             (body.raw_link,),
         )
-        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
-        domains = await _domains_with_latency_test(cursor, domains)
-        http_port = await _get_setting(cursor, "http_port", "8080")
-        socks_port = await _get_setting(cursor, "socks_port", "1080")
-        core_type = await _get_setting(cursor, "core_type", "sing-box")
-        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-        proxy_password = await _get_setting(cursor, "proxy_password", "")
         await conn.commit()
-    http_port = int(http_port)
-    socks_port = int(socks_port)
-    if core_type == "xray":
-        config = build_xray_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-        config_path = get_xray_config_path()
-    else:
-        config = build_singbox_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-        config_path = get_config_path()
-    write_config(config, config_path)
-    core_start(config_path, core_type)
+    # Update the config file with the new node
+    await _apply_node_config(body.raw_link)
     return {"ok": True}
 
 
@@ -435,21 +400,12 @@ async def _get_setting(cursor, key: str, default: str) -> str:
     return row[0] if row else default
 
 
-async def _domains_with_latency_test(cursor, domains: list) -> list:
-    """Merge latency_test_domain host into the domain list if not already present (so latency test goes through proxy)."""
-    test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip()
-    host = host_from_url(test_url) if test_url else None
-    if not host:
-        return domains
-    if any((d.get("value") or "").strip() == host for d in domains):
-        return domains
-    return domains + [{"type": "domain", "value": host, "outbound": "proxy"}]
-
-
 async def _apply_node_config(raw_link: str) -> None:
-    """Build config for the given node (by raw_link), write and start core. Does not update settings."""
+    """Apply node configuration by updating the config file's outbound section.
+    Reads existing config (with domains, DNS, etc.) and only updates the proxy outbound."""
     if not raw_link:
         return
+
     async with db_connection() as conn:
         cursor = await conn.cursor()
         await cursor.execute("SELECT parsed_json FROM nodes WHERE raw_link = ?", (raw_link,))
@@ -460,34 +416,98 @@ async def _apply_node_config(raw_link: str) -> None:
             parsed = parse_share_link(raw_link)
             if not parsed:
                 raise ValueError("Invalid or unknown node")
-        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
-        domains = await _domains_with_latency_test(cursor, domains)
-        http_port = int(await _get_setting(cursor, "http_port", "8080"))
-        socks_port = int(await _get_setting(cursor, "socks_port", "1080"))
+
+        # Get settings
         core_type = await _get_setting(cursor, "core_type", "sing-box")
         proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
         proxy_password = await _get_setting(cursor, "proxy_password", "")
-    if core_type == "xray":
-        config = build_xray_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-        config_path = get_xray_config_path()
-    else:
-        config = build_singbox_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
+
+    manager = get_config_manager(core_type)
+
+    # Ensure config file exists with proper structure
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        config = get_default_xray_config() if core_type == "xray" else get_default_singbox_config()
+
+    # Always reset inbounds to the correct default structure
+    # This ensures ports and listen addresses are always correct
+    if core_type == "sing-box":
+        default_config = get_default_singbox_config()
+        config["inbounds"] = default_config["inbounds"]
+        # Also set correct log level to suppress benign warnings
+        config["log"] = default_config["log"]
+
+        # Update proxy outbound with the new node
+        proxy_outbound = parsed_to_singbox_outbound(parsed)
+        outbounds = config.get("outbounds", [])
+        proxy_index = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "proxy"), None)
+        if proxy_index is not None:
+            outbounds[proxy_index] = proxy_outbound
+        else:
+            outbounds.append(proxy_outbound)
+        config["outbounds"] = outbounds
+
+        # Update inbounds with proxy auth if credentials provided
+        if proxy_username and proxy_password:
+            for inbound in config.get("inbounds", []):
+                if inbound.get("type") in ("http", "socks"):
+                    inbound["users"] = [{
+                        "username": proxy_username,
+                        "password": proxy_password
+                    }]
+        else:
+            # Remove users if no auth
+            for inbound in config.get("inbounds", []):
+                if "users" in inbound:
+                    del inbound["users"]
+
         config_path = get_config_path()
-    write_config(config, config_path)
+    else:  # xray
+        default_config = get_default_xray_config()
+        config["inbounds"] = default_config["inbounds"]
+
+        # Update proxy outbound with the new node
+        proxy_outbound = parsed_to_xray_outbound(parsed)
+        outbounds = config.get("outbounds", [])
+        proxy_index = next((i for i, ob in enumerate(outbounds) if ob.get("tag") == "proxy"), None)
+        if proxy_index is not None:
+            outbounds[proxy_index] = proxy_outbound
+        else:
+            outbounds.append(proxy_outbound)
+        config["outbounds"] = outbounds
+
+        # Update inbounds with proxy auth if credentials provided
+        if proxy_username and proxy_password:
+            for inbound in config.get("inbounds", []):
+                if inbound.get("protocol") in ("http", "socks"):
+                    inbound.setdefault("settings", {}).setdefault("users", [])
+                    inbound["settings"]["users"] = [{
+                        "user": proxy_username,
+                        "pass": proxy_password
+                    }]
+        else:
+            # Remove users if no auth
+            for inbound in config.get("inbounds", []):
+                if "settings" in inbound and "users" in inbound.get("settings", {}):
+                    del inbound["settings"]["users"]
+
+        config_path = get_xray_config_path()
+
+    # Write updated config
+    manager.write_config(config)
     core_start(config_path, core_type)
 
 
 async def _reapply_config_if_node_selected() -> None:
-    """If a node is selected, rebuild config (with current domains) and restart core. Used after domain add/delete."""
-    async with db_connection() as conn:
-        cursor = await conn.cursor()
-        selected_raw = (await _get_setting(cursor, "selected_node_raw", "") or "").strip()
-    if selected_raw:
-        try:
-            await _apply_node_config(selected_raw)
-        except ValueError:
-            pass
+    """Restart core to apply config file changes. Config file is the source of truth."""
+    settings_res = await get_settings("admin")  # Use admin user for internal calls
+    core_type = settings_res.get("core_type", "sing-box")
+    path = get_xray_config_path() if core_type == "xray" else get_config_path()
+
+    # Only restart if core is currently running
+    if core_status().get("running"):
+        core_restart(path, core_type)
 
 
 @app.post("/api/nodes/latency-test")
@@ -564,14 +584,168 @@ async def node_latency_test(
     return result
 
 
-# --- Proxy domains ---
+# --- Proxy domains (config-based) ---
+def _domain_to_routing_rule(domain_type: str, value: str, outbound: str, core_type: str) -> dict:
+    """Convert a domain entry to a routing rule for config file."""
+    outbound = outbound or "proxy"
+
+    if core_type == "sing-box":
+        # Sing-box format
+        if domain_type == "exact":
+            return {
+                "action": "route",
+                "outbound": outbound,
+                "domain": [value]
+            }
+        elif domain_type == "domain_suffix":
+            # Strip leading dot if present
+            clean_value = value.lstrip(".")
+            return {
+                "action": "route",
+                "outbound": outbound,
+                "domain_suffix": [f".{clean_value}"]
+            }
+        elif domain_type == "contains":
+            return {
+                "action": "route",
+                "outbound": outbound,
+                "domain_keyword": [value]
+            }
+        elif domain_type == "regex":
+            return {
+                "action": "route",
+                "outbound": outbound,
+                "domain_regex": [value]
+            }
+        else:
+            # Legacy types
+            if domain_type == "domain":
+                return {
+                    "action": "route",
+                    "outbound": outbound,
+                    "domain": [value]
+                }
+            elif domain_type == "suffix":
+                clean_value = value.lstrip(".")
+                return {
+                    "action": "route",
+                    "outbound": outbound,
+                    "domain_suffix": [f".{clean_value}"]
+                }
+            elif domain_type == "keyword":
+                return {
+                    "action": "route",
+                    "outbound": outbound,
+                    "domain_keyword": [value]
+                }
+            # Default to exact
+            return {
+                "action": "route",
+                "outbound": outbound,
+                "domain": [value]
+            }
+    else:
+        # Xray format
+        if domain_type == "exact":
+            return {
+                "type": "field",
+                "domain": [f"full:{value}"],
+                "outbound": outbound
+            }
+        elif domain_type == "domain_suffix":
+            clean_value = value.lstrip(".")
+            return {
+                "type": "field",
+                "domain": [f"domain:{clean_value}"],
+                "outbound": outbound
+            }
+        elif domain_type == "contains":
+            return {
+                "type": "field",
+                "domain": [f"keyword:{value}"],
+                "outbound": outbound
+            }
+        elif domain_type == "regex":
+            return {
+                "type": "field",
+                "domain": [f"regexp:{value}"],
+                "outbound": outbound
+            }
+        else:
+            # Legacy types
+            if domain_type == "domain":
+                return {
+                    "type": "field",
+                    "domain": [f"full:{value}"],
+                    "outbound": outbound
+                }
+            elif domain_type == "suffix":
+                clean_value = value.lstrip(".")
+                return {
+                    "type": "field",
+                    "domain": [f"domain:{clean_value}"],
+                    "outbound": outbound
+                }
+            elif domain_type == "keyword":
+                return {
+                    "type": "field",
+                    "domain": [f"keyword:{value}"],
+                    "outbound": outbound
+                }
+            # Default to exact
+            return {
+                "type": "field",
+                "domain": [f"full:{value}"],
+                "outbound": outbound
+            }
+
+
 @app.get("/api/domains")
 async def list_domains(username: str = Depends(get_current_user)):
-    async with db_connection() as conn:
-        cursor = await conn.cursor()
-        await cursor.execute("SELECT id, type, value, outbound FROM proxy_domains ORDER BY id")
-        rows = await cursor.fetchall()
-    return {"domains": [{"id": r[0], "type": r[1], "value": r[2], "outbound": r[3]} for r in rows]}
+    """List domains from config file route/routing section."""
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    try:
+        config = manager.read_config()
+        rules_key = "route" if core_type == "sing-box" else "routing"
+        rules = config.get(rules_key, {}).get("rules", [])
+
+        domains = []
+        for i, rule in enumerate(rules):
+            # Convert routing rules back to domain format
+            if core_type == "sing-box":
+                outbound = rule.get("outbound", "proxy")
+                # Parse sing-box rule format
+                if "domain" in rule:
+                    for domain in rule.get("domain", []):
+                        domains.append({"id": i, "type": "exact", "value": domain, "outbound": outbound})
+                if "domain_suffix" in rule:
+                    for suffix in rule.get("domain_suffix", []):
+                        domains.append({"id": i, "type": "domain_suffix", "value": suffix.lstrip("."), "outbound": outbound})
+                if "domain_keyword" in rule:
+                    for keyword in rule.get("domain_keyword", []):
+                        domains.append({"id": i, "type": "contains", "value": keyword, "outbound": outbound})
+                if "domain_regex" in rule:
+                    for regex in rule.get("domain_regex", []):
+                        domains.append({"id": i, "type": "regex", "value": regex, "outbound": outbound})
+            else:  # xray
+                if rule.get("type") == "field":
+                    domain_rule = rule.get("domain", [])
+                    outbound = rule.get("outbound", "proxy")
+                    for domain in domain_rule:
+                        if ":" in domain:
+                            rule_type, value = domain.split(":", 1)
+                            type_map = {"full": "exact", "domain": "domain_suffix", "keyword": "contains", "regexp": "regex"}
+                            domains.append({"id": i, "type": type_map.get(rule_type, "exact"), "value": value, "outbound": outbound})
+
+        return {"domains": domains}
+    except FileNotFoundError:
+        # Config file doesn't exist yet, return empty list
+        return {"domains": []}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/domains")
@@ -579,6 +753,7 @@ async def add_domain(
     body: DomainCreate,
     username: str = Depends(get_current_user),
 ):
+    """Add domain to config file."""
     if body.type not in ("domain", "suffix", "keyword", "regex", "exact", "domain_suffix", "contains"):
         raise HTTPException(status_code=400, detail="Invalid type")
     if body.outbound not in ("proxy", "direct"):
@@ -586,18 +761,35 @@ async def add_domain(
     value = (body.value or "").strip()
     if not value:
         raise HTTPException(status_code=400, detail="Value is required")
-    async with db_connection() as conn:
-        cursor = await conn.cursor()
-        await cursor.execute(
-            "INSERT INTO proxy_domains (type, value, outbound) VALUES (?, ?, ?)",
-            (body.type, value, body.outbound),
-        )
-        await cursor.execute("SELECT last_insert_rowid()")
-        row = await cursor.fetchone()
-        rid = int(row[0]) if row else 0
-        await conn.commit()
+
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    # Ensure config file exists
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        config = get_default_xray_config() if core_type == "xray" else get_default_singbox_config()
+
+    rules_key = "route" if core_type == "sing-box" else "routing"
+
+    # Convert domain to routing rule
+    new_rule = _domain_to_routing_rule(body.type, value, body.outbound, core_type)
+
+    if rules_key not in config:
+        config[rules_key] = {"rules": [], "final": "direct"}
+    if "rules" not in config[rules_key]:
+        config[rules_key]["rules"] = []
+
+    config[rules_key]["rules"].append(new_rule)
+    manager.write_config(config)
+
     await _reapply_config_if_node_selected()
-    return {"id": rid, "type": body.type, "value": value, "outbound": body.outbound}
+
+    # Return with id as the new index
+    new_id = len(config[rules_key]["rules"]) - 1
+    return {"id": new_id, "type": body.type, "value": value, "outbound": body.outbound}
 
 
 @app.delete("/api/domains/{domain_id}")
@@ -605,12 +797,26 @@ async def delete_domain(
     domain_id: int,
     username: str = Depends(get_current_user),
 ):
-    async with db_connection() as conn:
-        cursor = await conn.cursor()
-        await cursor.execute("DELETE FROM proxy_domains WHERE id = ?", (domain_id,))
-        await conn.commit()
-    await _reapply_config_if_node_selected()
-    return {"ok": True}
+    """Delete domain from config by index."""
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Config file not found")
+
+    rules_key = "route" if core_type == "sing-box" else "routing"
+
+    rules = config.get(rules_key, {}).get("rules", [])
+    if 0 <= domain_id < len(rules):
+        rules.pop(domain_id)
+        manager.write_config(config)
+        await _reapply_config_if_node_selected()
+        return {"ok": True}
+    else:
+        raise HTTPException(status_code=404, detail="Domain not found")
 
 
 def _parse_domain_line(line: str) -> tuple[str, str] | None:
@@ -648,15 +854,32 @@ async def bulk_add_domains(
             pairs.append((type_, value))
     if not pairs:
         return {"added": 0, "message": "No valid lines to add"}
-    async with db_connection() as conn:
-        cursor = await conn.cursor()
-        for type_, value in pairs:
-            await cursor.execute(
-                "INSERT INTO proxy_domains (type, value, outbound) VALUES (?, ?, ?)",
-                (type_, value, body.outbound),
-            )
-        await conn.commit()
+
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    # Ensure config file exists
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        config = get_default_xray_config() if core_type == "xray" else get_default_singbox_config()
+
+    rules_key = "route" if core_type == "sing-box" else "routing"
+
+    if rules_key not in config:
+        config[rules_key] = {"rules": [], "final": "direct"}
+    if "rules" not in config[rules_key]:
+        config[rules_key]["rules"] = []
+
+    # Add all domains as routing rules
+    for type_, value in pairs:
+        new_rule = _domain_to_routing_rule(type_, value, body.outbound, core_type)
+        config[rules_key]["rules"].append(new_rule)
+
+    manager.write_config(config)
     await _reapply_config_if_node_selected()
+
     return {"added": len(pairs), "message": f"Added {len(pairs)} domain rule(s)."}
 
 
@@ -699,30 +922,9 @@ async def apply_manual_config(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
             (raw_link,),
         )
-        await cursor.execute("SELECT type, value, outbound FROM proxy_domains ORDER BY id")
-        domains = [{"type": r[0], "value": r[1], "outbound": r[2]} for r in await cursor.fetchall()]
-        domains = await _domains_with_latency_test(cursor, domains)
-        http_port = await _get_setting(cursor, "http_port", "8080")
-        socks_port = await _get_setting(cursor, "socks_port", "1080")
-        core_type = await _get_setting(cursor, "core_type", "sing-box")
-        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-        proxy_password = await _get_setting(cursor, "proxy_password", "")
         await conn.commit()
-    http_port = int(http_port)
-    socks_port = int(socks_port)
-    try:
-        if core_type == "xray":
-            config = build_xray_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-            config_path = get_xray_config_path()
-        else:
-            config = build_singbox_config(parsed, domains, http_port, socks_port, proxy_username, proxy_password)
-            config_path = get_config_path()
-        write_config(config, config_path)
-        core_start(config_path, core_type)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    # Update the config file with the new manual node
+    await _apply_node_config(raw_link)
     return {"ok": True}
 
 
@@ -811,6 +1013,40 @@ def _singbox_traffic_bytes() -> tuple[int | None, int | None]:
 
 
 # --- Core status and control ---
+def _get_ports_from_config(core_type: str) -> tuple[int, int]:
+    """Get http and socks ports from config file. Returns (http_port, socks_port)."""
+    try:
+        manager = get_config_manager(core_type)
+        config = manager.read_config()
+        inbounds = config.get("inbounds", [])
+        http_port = 8080
+        socks_port = 1080
+
+        for inbound in inbounds:
+            if core_type == "sing-box":
+                inbound_type = inbound.get("type", "")
+                port = inbound.get("listen_port", 8080)
+                if inbound_type == "http":
+                    http_port = port
+                elif inbound_type == "socks":
+                    socks_port = port
+                elif inbound_type == "mixed":
+                    # Mixed type handles both HTTP and SOCKS on same port
+                    http_port = port
+                    socks_port = port
+            else:  # xray
+                protocol = inbound.get("protocol", "")
+                port = inbound.get("port", 8080)
+                if protocol == "http":
+                    http_port = port
+                elif protocol == "socks":
+                    socks_port = port
+        return (http_port, socks_port)
+    except FileNotFoundError:
+        # Config file doesn't exist, return defaults
+        return (8080, 1080)
+
+
 @app.get("/api/status")
 async def status(username: str = Depends(get_current_user)):
     st = core_status()
@@ -849,11 +1085,14 @@ async def status(username: str = Depends(get_current_user)):
             if down is not None:
                 usage["download_bytes"] = down
 
+    # Get ports from config file
+    http_port, socks_port = _get_ports_from_config(settings.get("core_type", "sing-box"))
+
     return {
         "core": st,
         "core_type": settings.get("core_type", "sing-box"),
-        "http_port": int(settings["http_port"]),
-        "socks_port": int(settings["socks_port"]),
+        "http_port": http_port,
+        "socks_port": socks_port,
         "proxy_display_host": settings.get("proxy_display_host", "127.0.0.1"),
         "proxy_username": (settings.get("proxy_username") or "").strip() or "",
         "proxy_password": settings.get("proxy_password") or "",
@@ -869,11 +1108,13 @@ async def status(username: str = Depends(get_current_user)):
 
 @app.post("/api/core/start")
 async def core_start_api(username: str = Depends(get_current_user)):
-    """Start the core. If config is missing, runs a refresh first (which also starts the core)."""
+    """Start the core with the config file. If config file is missing, runs a refresh first."""
     from pathlib import Path
     settings_res = await get_settings(username)
     core_type = settings_res.get("core_type", "sing-box")
     path = get_xray_config_path() if core_type == "xray" else get_config_path()
+
+    # If config file doesn't exist, try to refresh to create it
     if not Path(path).exists():
         await refresh_and_apply()
         return {"ok": True, "running": core_status()["running"]}
@@ -889,13 +1130,12 @@ async def core_stop_api(username: str = Depends(get_current_user)):
 
 @app.post("/api/core/restart")
 async def core_restart_api(username: str = Depends(get_current_user)):
-    """Restart the core. Refreshes config from DB then stop+start."""
-    await refresh_and_apply()
+    """Restart the core with the current config file."""
     settings_res = await get_settings(username)
     core_type = settings_res.get("core_type", "sing-box")
     path = get_xray_config_path() if core_type == "xray" else get_config_path()
-    ok = core_restart(path, core_type)
-    return {"ok": ok, "running": core_status()["running"]}
+    core_restart(path, core_type)
+    return {"ok": True, "running": core_status()["running"]}
 
 
 @app.get("/api/core/logs")
@@ -918,7 +1158,8 @@ async def core_latency_test(
     url = (body and body.url) or settings_res.get("latency_test_domain", "").strip()
     if not url:
         raise HTTPException(status_code=400, detail="No test URL. Set a URL in Core → Latency test and save.")
-    http_port = int(settings_res.get("http_port", "8080"))
+    core_type = settings_res.get("core_type", "sing-box")
+    http_port, _ = _get_ports_from_config(core_type)
     proxy_username = (settings_res.get("proxy_username") or "").strip()
     proxy_password = settings_res.get("proxy_password") or ""
     result = await asyncio.to_thread(run_latency_test, url, http_port, proxy_username, proxy_password)
@@ -934,6 +1175,118 @@ async def core_latency_test(
             )
             await conn.commit()
     return result
+
+
+@app.get("/api/config")
+async def get_config(username: str = Depends(get_current_user)):
+    """Return the current core config JSON from file (sing-box or Xray)."""
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    config_path = get_xray_config_path() if core_type == "xray" else get_config_path()
+
+    try:
+        manager = get_config_manager(core_type)
+        config = manager.read_config()
+        return {"config": config, "exists": True, "path": config_path, "is_custom": False}
+    except FileNotFoundError:
+        # Return default config if file doesn't exist
+        default = get_default_config(core_type)
+        return {"config": default, "exists": False, "path": config_path, "is_custom": False}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to read config: {str(e)}")
+
+
+@app.get("/api/config/structure")
+async def get_config_structure(username: str = Depends(get_current_user)):
+    """Get available config sections based on core type."""
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+
+    if core_type == "sing-box":
+        sections = [
+            {"name": "dns", "label": "DNS", "description": "DNS servers and rules"},
+            {"name": "outbounds", "label": "Outbound", "description": "Proxy and direct outbounds"},
+            {"name": "route", "label": "Rules", "description": "Routing rules"}
+        ]
+    else:  # xray
+        sections = [
+            {"name": "dns", "label": "DNS", "description": "DNS servers and rules"},
+            {"name": "outbounds", "label": "Outbound", "description": "Proxy and direct outbounds"},
+            {"name": "routing", "label": "Rules", "description": "Routing rules"}
+        ]
+
+    sections.append({"name": "all", "label": "All", "description": "Full configuration"})
+
+    return {"sections": sections, "core_type": core_type}
+
+
+@app.get("/api/config/section/{section_name}")
+async def get_config_section(
+    section_name: str,
+    username: str = Depends(get_current_user)
+):
+    """Get a specific section of the config (log, dns, inbounds, outbounds, route, routing, all)."""
+    # Validate section name
+    valid_sections = ["log", "dns", "inbounds", "outbounds", "route", "routing", "all"]
+    if section_name not in valid_sections:
+        raise HTTPException(status_code=400, detail="Invalid section name")
+
+    # Get config from file
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    try:
+        config_json = manager.read_config()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Config file not found")
+
+    # Return specific section or full config
+    if section_name == "all":
+        return {"section": "all", "data": config_json, "core_type": core_type}
+
+    # Map route→routing for Xray compatibility
+    section_key = "routing" if section_name == "route" and core_type == "xray" else section_name
+
+    if section_key not in config_json:
+        raise HTTPException(status_code=404, detail=f"Section '{section_key}' not found in config")
+
+    return {"section": section_name, "data": config_json[section_key], "core_type": core_type}
+
+
+class ConfigSectionUpdate(BaseModel):
+    data: dict
+
+
+@app.put("/api/config/section/{section_name}")
+async def update_config_section(
+    section_name: str,
+    body: ConfigSectionUpdate,
+    username: str = Depends(get_current_user)
+):
+    """Update a specific section of the config file."""
+    valid_sections = ["dns", "outbounds", "route", "routing", "inbounds", "log"]
+    if section_name not in valid_sections:
+        raise HTTPException(status_code=400, detail="Invalid section name")
+
+    # Get settings and config manager
+    settings_res = await get_settings(username)
+    core_type = settings_res.get("core_type", "sing-box")
+    manager = get_config_manager(core_type)
+
+    try:
+        # Validate section data
+        section_data = body.data
+        json.dumps(section_data)
+
+        # Update section in config file
+        manager.update_section(section_name, section_data)
+
+        return {"ok": True, "message": f"Section '{section_name}' updated successfully"}
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Config file not found")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to update config: {str(e)}")
 
 
 # --- API only; frontend is served separately ---

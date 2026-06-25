@@ -1,5 +1,34 @@
 const API_BASE = ''
 
+// Config section types
+export type ConfigSectionName = 'dns' | 'outbounds' | 'route' | 'routing' | 'all'
+
+export interface ConfigSectionInfo {
+  name: ConfigSectionName
+  label: string
+  description: string
+}
+
+export interface ConfigStructureResponse {
+  sections: ConfigSectionInfo[]
+  core_type: 'sing-box' | 'xray'
+}
+
+export interface ConfigSectionResponse {
+  section: ConfigSectionName
+  data: Record<string, unknown>
+  core_type: 'sing-box' | 'xray'
+}
+
+export interface ConfigUpdateRequest {
+  data: Record<string, unknown>
+}
+
+export interface ConfigUpdateResponse {
+  ok: boolean
+  message: string
+}
+
 function getToken(): string {
   return localStorage.getItem('token') || ''
 }
@@ -53,6 +82,10 @@ export const settings = {
       proxy_display_host: string
       proxy_username: string
       proxy_password: string
+      use_custom_config: boolean
+      custom_config: string
+      dns_servers: string
+      dns_final: string
     }>('/api/settings'),
   update: (body: {
     subscription_url?: string
@@ -65,6 +98,10 @@ export const settings = {
     proxy_display_host?: string
     proxy_username?: string
     proxy_password?: string
+    use_custom_config?: boolean
+    custom_config?: string
+    dns_servers?: string
+    dns_final?: string
   }) => api<{ ok: boolean }>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
 }
 
@@ -177,5 +214,21 @@ export const core = {
     }>('/api/core/latency-test', {
       method: 'POST',
       body: JSON.stringify({ url: url || undefined }),
+    }),
+  getConfig: () =>
+    api<{ config: Record<string, unknown> | null; exists: boolean; path: string; is_custom: boolean }>('/api/config'),
+}
+
+export const config = {
+  getStructure: () =>
+    api<ConfigStructureResponse>('/api/config/structure'),
+
+  getSection: (section: ConfigSectionName) =>
+    api<ConfigSectionResponse>(`/api/config/section/${section}`),
+
+  updateSection: (section: ConfigSectionName, data: Record<string, unknown>) =>
+    api<ConfigUpdateResponse>(`/api/config/section/${section}`, {
+      method: 'PUT',
+      body: JSON.stringify({ data }),
     }),
 }

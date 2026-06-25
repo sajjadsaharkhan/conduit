@@ -1,11 +1,24 @@
 """Generate sing-box JSON config from selected node and proxy_domains."""
 import json
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
 # When set (e.g. SINGBOX_CLASH_API=1), add experimental Clash API so Dashboard can show upload/download for sing-box
 SINGBOX_CLASH_API_ENV = "SINGBOX_CLASH_API"
 SINGBOX_CLASH_API_PORT = 9092
+
+# Default DNS configuration
+DEFAULT_DNS_SERVERS = [
+    {"address": "223.5.5.5", "tag": "local_dns", "detour": "direct"},
+    {"address": "https://1.1.1.1/dns-query", "tag": "remote_dns", "detour": "proxy", "addressResolver": "local_dns"},
+    {"address": "https://8.8.8.8/dns-query", "tag": "remote_dns_alt", "detour": "direct", "addressResolver": "local_dns"}
+]
+
+DEFAULT_DNS_RULES = [
+    {"type": "field", "domain": ["domain:doh.pub", "domain:dot.pub", "domain:alidns.com", "domain:360.cn", "domain:onedns.net"], "server": "remote_dns_alt"}
+]
+
+DEFAULT_DNS_FINAL = "remote_dns"
 
 
 def _first_param(params: Dict[str, Any], key: str, default: str = "") -> str:
@@ -207,6 +220,9 @@ def build_singbox_config(
     socks_port: int = 1080,
     proxy_username: str = "",
     proxy_password: str = "",
+    dns_servers: Optional[List[Dict[str, Any]]] = None,
+    dns_rules: Optional[List[Dict[str, Any]]] = None,
+    dns_final: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build full sing-box config: inbounds (http + socks), outbounds (proxy + direct), route rules.
@@ -262,8 +278,8 @@ def build_singbox_config(
     use_auth = bool((proxy_username or "").strip() and proxy_password is not None)
     users = [{"username": (proxy_username or "").strip(), "password": proxy_password or ""}] if use_auth else []
 
-    # Legacy DNS format only (no "type" / "server" / hosts); compatible with sing-box < 1.12.0
-    dns_servers = [
+    # Use provided DNS settings or defaults
+    dns_servers = dns_servers or [
         {"tag": "local_local", "address": "223.5.5.5"},
         {
             "tag": "remote_dns",
@@ -277,13 +293,14 @@ def build_singbox_config(
             "address_resolver": "local_local",
         },
     ]
-    dns_rules = [
+    dns_rules = dns_rules or [
         {"server": "direct_dns", "domain_suffix": ["alidns.com", "doh.pub", "dot.pub", "360.cn", "onedns.net"]},
     ]
+    dns_final_server = dns_final or "remote_dns"
     dns_block = {
         "servers": dns_servers,
         "rules": dns_rules,
-        "final": "remote_dns",
+        "final": dns_final_server,
         "independent_cache": True,
     }
 
@@ -389,8 +406,24 @@ def build_minimal_xray_config(outbound_node: Dict[str, Any], http_port: int = LA
     if not proxy_out:
         raise ValueError("Unsupported node type or invalid node.")
     sniff = {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}
+
+    # Minimal DNS configuration for latency test
+    dns_config = {
+        "servers": [
+            {"address": "223.5.5.5", "tag": "local_dns", "detour": "direct"},
+            {
+                "address": "https://1.1.1.1/dns-query",
+                "tag": "remote_dns",
+                "detour": "proxy",
+                "addressResolver": "local_dns"
+            }
+        ],
+        "final": "remote_dns"
+    }
+
     return {
         "log": {"loglevel": "warning"},
+        "dns": dns_config,
         "inbounds": [
             {
                 "listen": "127.0.0.1",
@@ -560,11 +593,17 @@ def build_xray_config(
     socks_port: int = 1080,
     proxy_username: str = "",
     proxy_password: str = "",
+    dns_servers: Optional[List[Dict[str, Any]]] = None,
+    dns_rules: Optional[List[Dict[str, Any]]] = None,
+    dns_final: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Build full Xray config: inbounds (http + socks), outbounds (proxy + direct), routing rules.
     proxy_domains: list of {"type": "domain"|"suffix"|"keyword"|"regex", "value": "..."}
     When proxy_username and proxy_password are both non-empty, HTTP and SOCKS inbounds require auth.
+    dns_servers: list of DNS server configs (optional, uses defaults if not provided)
+    dns_rules: list of DNS routing rules (optional)
+    dns_final: final DNS server tag (optional, defaults to "remote_dns")
     """
     # Support raw sing-box outbound from manual paste: convert to our parsed shape then to Xray
     if _is_singbox_outbound(outbound_node):
@@ -627,8 +666,44 @@ def build_xray_config(
     # API inbound for stats (StatsService); route to api outbound (Xray creates it when api is set)
     api_port = 10085
     api_rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
+
+    # DNS configuration for Xray - use provided settings or defaults
+    dns_final_server = dns_final or "remote_dns"
+    dns_config = {
+        "servers": dns_servers or [
+            {
+                "address": "223.5.5.5",
+                "tag": "local_dns",
+                "detour": "direct"
+            },
+            {
+                "address": "https://1.1.1.1/dns-query",
+                "tag": "remote_dns",
+                "detour": "proxy",
+                "addressResolver": "local_dns"
+            },
+            {
+                "address": "https://8.8.8.8/dns-query",
+                "tag": "remote_dns_alt",
+                "detour": "direct",
+                "addressResolver": "local_dns"
+            }
+        ],
+        "rules": dns_rules or [
+            {
+                "type": "field",
+                "domain": ["domain:doh.pub", "domain:dot.pub", "domain:alidns.com", "domain:360.cn", "domain:onedns.net"],
+                "server": "remote_dns_alt"
+            }
+        ],
+        "final": dns_final_server,
+        "disableCache": False,
+        "disableExpire": False
+    }
+
     config = {
         "log": {"loglevel": "warning"},
+        "dns": dns_config,
         "stats": {},
         "api": {"tag": "api", "services": ["StatsService"]},
         "policy": {

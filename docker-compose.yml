@@ -8,6 +8,7 @@ services:
       - "1080:1080"   # SOCKS5 proxy
     volumes:
       - conduit_data:/data
+      - ./backend:/app/backend   # Mount backend code for development
     environment:
       - ADMIN_USERNAME=admin
       - ADMIN_PASSWORD=admin

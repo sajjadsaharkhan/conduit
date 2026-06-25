@@ -39,6 +39,11 @@ export default function Core() {
     size_bytes: number
     success: boolean
     error: string | null
+    status_code: number | null
+    headers: Record<string, string>
+    response_preview: string
+    proxy_used: string
+    has_proxy_auth: boolean
   } | null>(null)
 
   function load() {
@@ -174,6 +179,11 @@ export default function Core() {
         duration_ms: null,
         download_speed_kbps: null,
         size_bytes: 0,
+        status_code: null,
+        headers: {},
+        response_preview: '',
+        proxy_used: '',
+        has_proxy_auth: false,
       })
     } finally {
       setLatencyTesting(false)
@@ -359,43 +369,76 @@ export default function Core() {
             </Button>
           </div>
           {latencyResult && (
-            <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm">
-              {latencyResult.success ? (
+            <div className="space-y-3">
+              {/* Connection Info */}
+              <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm">
                 <div className="flex flex-wrap gap-x-4 gap-y-1">
-                  {latencyResult.latency_ms != null && (
-                    <span>Latency: <strong>{latencyResult.latency_ms} ms</strong></span>
+                  {latencyResult.status_code && (
+                    <span>Status: <strong>{latencyResult.status_code}</strong></span>
                   )}
-                  {latencyResult.duration_ms != null && (
-                    <span>Duration: <strong>{latencyResult.duration_ms} ms</strong></span>
+                  {latencyResult.proxy_used && (
+                    <span>Proxy: <strong className="text-xs">{latencyResult.proxy_used}</strong></span>
                   )}
-                  {latencyResult.download_speed_kbps != null && (
-                    <span>Download: <strong>{latencyResult.download_speed_kbps} Kbps</strong></span>
+                  {latencyResult.has_proxy_auth && (
+                    <span>Auth: <strong>Enabled</strong></span>
                   )}
-                  <span>Size: <strong>{latencyResult.size_bytes} B</strong></span>
                 </div>
-              ) : (
-                <p className="text-destructive">{latencyResult.error ?? 'Test failed'}</p>
+              </div>
+
+              {/* Performance Metrics */}
+              <div className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm">
+                {latencyResult.success ? (
+                  <div className="flex flex-wrap gap-x-4 gap-y-1">
+                    {latencyResult.latency_ms != null && (
+                      <span>Latency: <strong>{latencyResult.latency_ms} ms</strong></span>
+                    )}
+                    {latencyResult.duration_ms != null && (
+                      <span>Duration: <strong>{latencyResult.duration_ms} ms</strong></span>
+                    )}
+                    {latencyResult.download_speed_kbps != null && (
+                      <span>Download: <strong>{latencyResult.download_speed_kbps} Kbps</strong></span>
+                    )}
+                    <span>Size: <strong>{latencyResult.size_bytes} B</strong></span>
+                  </div>
+                ) : (
+                  <p className="text-destructive">{latencyResult.error ?? 'Test failed'}</p>
+                )}
+              </div>
+
+              {/* Response Preview */}
+              {latencyResult.success && latencyResult.response_preview && (
+                <div className="rounded-md border border-border bg-muted/30">
+                  <div className="px-3 py-2 border-b border-border">
+                    <span className="text-sm font-medium">Response Preview</span>
+                    <span className="text-xs text-muted-foreground ml-2">(first ~10KB)</span>
+                  </div>
+                  <div className="p-3">
+                    <pre className="text-xs font-mono whitespace-pre-wrap break-all max-h-[200px] overflow-auto">
+                      {latencyResult.response_preview}
+                    </pre>
+                  </div>
+                </div>
               )}
             </div>
           )}
         </CardContent>
       </Card>
 
-      {/* Full logs at the end */}
+      {/* Logs */}
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
           <div>
-            <CardTitle>Full logs</CardTitle>
-            <CardDescription>Complete log buffer (not real-time)</CardDescription>
+            <CardTitle>Logs</CardTitle>
+            <CardDescription>View core logs in real-time</CardDescription>
           </div>
           <Button variant="outline" size="sm" onClick={loadFullLogs} disabled={logsLoading}>
-            {logsLoading ? 'Loading…' : 'Load logs'}
+            {logsLoading ? 'Loading…' : 'Reload'}
           </Button>
         </CardHeader>
         <CardContent>
-          <div className="max-h-[400px] overflow-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-xs">
+          <div className="max-h-[500px] overflow-auto rounded-md border border-border bg-muted/30 p-3 font-mono text-xs">
             {fullLogs.length === 0 && !logsLoading ? (
-              <p className="text-muted-foreground">Click &quot;Load logs&quot; to fetch the full log buffer.</p>
+              <p className="text-muted-foreground">Click &quot;Reload&quot; to fetch the log buffer.</p>
             ) : (
               <pre className="whitespace-pre-wrap break-all">
                 {fullLogs.map((line, i) => (
