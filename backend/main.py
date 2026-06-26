@@ -8,6 +8,7 @@ import time
 from urllib.request import urlopen
 from urllib.error import URLError
 from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Union
 import aiosqlite
 from fastapi import FastAPI, Depends, HTTPException, Header, Path
 from fastapi.middleware.cors import CORSMiddleware
@@ -1255,7 +1256,7 @@ async def get_config_section(
 
 
 class ConfigSectionUpdate(BaseModel):
-    data: dict
+    data: Union[Dict[str, Any], List[Any]]
 
 
 @app.put("/api/config/section/{section_name}")
@@ -1265,7 +1266,7 @@ async def update_config_section(
     username: str = Depends(get_current_user)
 ):
     """Update a specific section of the config file."""
-    valid_sections = ["dns", "outbounds", "route", "routing", "inbounds", "log"]
+    valid_sections = ["dns", "outbounds", "route", "routing", "inbounds", "log", "all"]
     if section_name not in valid_sections:
         raise HTTPException(status_code=400, detail="Invalid section name")
 
@@ -1278,6 +1279,13 @@ async def update_config_section(
         # Validate section data
         section_data = body.data
         json.dumps(section_data)
+
+        # When "all", write the entire config directly
+        if section_name == "all":
+            if not isinstance(section_data, dict):
+                raise HTTPException(status_code=400, detail="Config data must be a dict when updating 'all'")
+            manager.write_config(section_data)
+            return {"ok": True, "message": "Full config updated successfully"}
 
         # Update section in config file
         manager.update_section(section_name, section_data)
