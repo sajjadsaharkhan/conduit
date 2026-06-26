@@ -36,6 +36,8 @@ import {
   AlertCircle,
   Gauge,
   Play,
+  Download,
+  Upload,
 } from 'lucide-react'
 import type { ConfigSectionName, ConfigSectionInfo } from '../api'
 
@@ -68,6 +70,8 @@ export default function Core() {
   const [jsonEditorValue, setJsonEditorValue] = useState('')
   const [jsonError, setJsonError] = useState('')
   const [activeParentTab, setActiveParentTab] = useState<'logs' | 'config'>('logs')
+  const [importExportLoading, setImportExportLoading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   // Latency test state
   const [latencyTestDomain, setLatencyTestDomain] = useState('')
@@ -267,6 +271,74 @@ export default function Core() {
   function handleReloadConfig() {
     if (activeTab) {
       loadSection(activeTab)
+    }
+  }
+
+  async function handleExportConfig() {
+    setImportExportLoading(true)
+    setSaveMessage(null)
+    try {
+      const res = await config.getSection('all')
+      const configJson = JSON.stringify(res.data, null, 2)
+      const blob = new Blob([configJson], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${coreType}-config-${new Date().toISOString().slice(0, 10)}.json`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+      setSaveMessage({ type: 'success', text: 'Configuration exported successfully' })
+    } catch (e) {
+      setSaveMessage({
+        type: 'error',
+        text: e instanceof Error ? e.message : 'Failed to export configuration',
+      })
+    } finally {
+      setImportExportLoading(false)
+    }
+  }
+
+  function handleImportConfigClick() {
+    fileInputRef.current?.click()
+  }
+
+  async function handleImportConfigChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setImportExportLoading(true)
+    setSaveMessage(null)
+
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+
+      // Validate JSON structure
+      if (typeof data !== 'object' || data === null) {
+        throw new Error('Invalid configuration format')
+      }
+
+      await config.updateSection('all', data)
+      setSaveMessage({ type: 'success', text: 'Configuration imported successfully. Reload to view changes.' })
+      setHasChanges(false)
+
+      // Reload current section if it's the 'all' tab
+      if (activeTab === 'all') {
+        setTimeout(() => loadSection('all'), 500)
+      }
+    } catch (e) {
+      setSaveMessage({
+        type: 'error',
+        text: e instanceof Error ? e.message : 'Failed to import configuration',
+      })
+    } finally {
+      setImportExportLoading(false)
+      // Reset file input
+      if (fileInputRef.current) {
+        fileInputRef.current.value = ''
+      }
     }
   }
 
@@ -655,6 +727,34 @@ export default function Core() {
                   {/* Save/Reload Bar */}
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-2">
+                      {/* Import/Export Button Group */}
+                      <div className="flex items-center gap-0 rounded-md border border-border">
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={handleExportConfig}
+                          disabled={importExportLoading}
+                          className="rounded-r-none border-r-0 pr-3"
+                        >
+                          <Download className="h-4 w-4" />
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={handleImportConfigClick}
+                          disabled={importExportLoading}
+                          className="rounded-l-none border-l-0 pl-3"
+                        >
+                          <Upload className="h-4 w-4" />
+                        </Button>
+                      </div>
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        accept="application/json,.json"
+                        onChange={handleImportConfigChange}
+                        className="hidden"
+                      />
                       {saveMessage && (
                         <div
                           className={cn(
