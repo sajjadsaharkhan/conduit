@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { settings, nodes as nodesApi, status as statusApi } from '../api'
+import { settings, nodes as nodesApi, status as statusApi, type Multiplex } from '../api'
 import { ProxyEndpoints } from '@/components/ProxyEndpoints'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
 import { Checkbox } from '@/components/ui/checkbox'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -27,7 +28,15 @@ import { Tooltip } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { Pencil, Trash2, Plus, Info, ArrowUpDown, ArrowUp, ArrowDown } from 'lucide-react'
 
-type Node = { id: number; source: string; raw_link: string; name: string; latency_ms: number | null; real_latency_ms: number | null; last_check: string | null }
+type Node = { id: number; source: string; raw_link: string; name: string; latency_ms: number | null; real_latency_ms: number | null; last_check: string | null; multiplex: Multiplex }
+type NodeMode = 'manual' | 'auto'
+
+const MULTIPLEX_OPTIONS: { value: Multiplex; label: string }[] = [
+  { value: 'off', label: 'Off' },
+  { value: 'h2mux', label: 'h2mux' },
+  { value: 'smux', label: 'smux' },
+  { value: 'yamux', label: 'yamux' },
+]
 
 export default function Proxy() {
   const [loading, setLoading] = useState(true)
@@ -42,6 +51,9 @@ export default function Proxy() {
   const [deleteModal, setDeleteModal] = useState<{ id: number; name: string } | null>(null)
   const [editModal, setEditModal] = useState<Node | null>(null)
   const [editRawLink, setEditRawLink] = useState('')
+  const [editMultiplex, setEditMultiplex] = useState<Multiplex>('off')
+  const [nodeMode, setNodeMode] = useState<NodeMode>('manual')
+  const [savingMode, setSavingMode] = useState(false)
   const [updating, setUpdating] = useState(false)
 
   const [manualOpen, setManualOpen] = useState(false)
@@ -71,6 +83,7 @@ export default function Proxy() {
     statusApi.get().then(setProxyStatus).catch(() => {})
     Promise.all([settings.get(), nodesApi.list()]).then(([setRes, nodesRes]) => {
       setList(nodesRes.nodes)
+      setNodeMode(setRes.node_mode || 'manual')
       setSelectedRaw(setRes.selected_node_raw || '')
     }).finally(() => setLoading(false))
   }
@@ -78,6 +91,28 @@ export default function Proxy() {
   useEffect(() => {
     load()
   }, [])
+
+  async function handleModeChange(mode: NodeMode) {
+    if (mode === nodeMode) return
+    setSavingMode(true)
+    setMessage(null)
+    try {
+      await settings.update({ node_mode: mode })
+      setNodeMode(mode)
+      setMessage(
+        mode === 'auto'
+          ? 'Auto mode on: the fastest node is picked by real delay every minute. Core restarted.'
+          : 'Manual mode on: you pick the node; switching is live. Core restarted.',
+      )
+      setMessageSuccess(true)
+      load()
+    } catch (e) {
+      setMessage(e instanceof Error ? e.message : 'Failed to change mode')
+      setMessageSuccess(false)
+    } finally {
+      setSavingMode(false)
+    }
+  }
 
   async function handlePingAll() {
     setPinging(true)
@@ -98,9 +133,10 @@ export default function Proxy() {
     setSelecting(node.raw_link)
     setMessage(null)
     try {
-      await nodesApi.select(node.raw_link, node.id)
+      const res = await nodesApi.select(node.raw_link, node.id)
       setSelectedRaw(node.raw_link)
-      setMessage('Node selected and core restarted.')
+      statusApi.get().then(setProxyStatus).catch(() => {})
+      setMessage(res.live ? 'Switched live. Open connections were kept.' : 'Node selected and core restarted.')
       setMessageSuccess(true)
       loadSettings()
     } catch (e) {
@@ -135,6 +171,7 @@ export default function Proxy() {
   function openEditModal(node: Node) {
     setEditModal(node)
     setEditRawLink(node.raw_link)
+    setEditMultiplex(node.multiplex || 'off')
   }
 
   async function handleUpdateNode() {
@@ -142,7 +179,11 @@ export default function Proxy() {
     setUpdating(true)
     setMessage(null)
     try {
-      await nodesApi.update(editModal.id, editRawLink.trim())
+      const rawLink = editRawLink.trim()
+      await nodesApi.update(editModal.id, {
+        raw_link: rawLink !== editModal.raw_link ? rawLink : undefined,
+        multiplex: editMultiplex !== editModal.multiplex ? editMultiplex : undefined,
+      })
       setMessage('Node updated.')
       setMessageSuccess(true)
       setEditModal(null)
@@ -280,6 +321,7 @@ export default function Proxy() {
 
       <Card>
         <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-2">
+          <div className="space-y-3">
           <div className="flex items-center gap-1.5">
             <CardTitle>Nodes</CardTitle>
             <Tooltip
@@ -290,6 +332,31 @@ export default function Proxy() {
                 <Info className="h-4 w-4" />
               </span>
             </Tooltip>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <div role="group" aria-label="Node selection mode" className="inline-flex rounded-md bg-background p-0.5 ring-1 ring-border">
+              {(['manual', 'auto'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  aria-pressed={nodeMode === m}
+                  disabled={savingMode}
+                  onClick={() => handleModeChange(m)}
+                  className={cn(
+                    'min-h-9 rounded px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50',
+                    nodeMode === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {m === 'manual' ? 'Manual' : 'Auto (fastest)'}
+                </button>
+              ))}
+            </div>
+            <p className="text-sm text-muted-foreground">
+              {nodeMode === 'manual'
+                ? 'You choose the node. Switching is live on sing-box: open connections are kept.'
+                : 'The core measures real delay through every node each minute and uses the fastest.'}
+            </p>
+          </div>
           </div>
           <div className="flex items-center gap-2">
             <Button variant="secondary" size="sm" onClick={handlePingAll} disabled={pinging || list.length === 0}>
@@ -352,17 +419,23 @@ export default function Proxy() {
                   </TableRow>
                 )}
                 {sortByLatency(list).map((n) => {
+                  const isCurrent = proxyStatus?.active_node_id != null ? proxyStatus.active_node_id === n.id : selectedRaw === n.raw_link
                   const latency = displayLatency(n)
                   const test = nodeTestResults[n.id]
                   return (
                     <TableRow
                       key={n.id}
-                      className={cn(selectedRaw === n.raw_link && 'bg-primary/10 border-l-4 border-l-primary')}
+                      className={cn(isCurrent && 'bg-primary/10 border-l-4 border-l-primary')}
                     >
-                      <TableCell className="font-mono text-sm max-w-[200px] truncate">
+                      <TableCell className="font-mono text-sm max-w-[240px] truncate">
                         {n.name || n.raw_link.slice(0, 40)}
-                        {selectedRaw === n.raw_link && (
+                        {isCurrent && (
                           <span className="ml-2 text-xs font-medium text-primary">(current)</span>
+                        )}
+                        {n.multiplex !== 'off' && (
+                          <span className="ml-2 rounded bg-muted px-1.5 py-0.5 font-sans text-[11px] font-medium text-muted-foreground" title="Connection pooling to this node">
+                            MUX {n.multiplex}
+                          </span>
                         )}
                       </TableCell>
                       <TableCell>
@@ -395,7 +468,13 @@ export default function Proxy() {
                       </TableCell>
                       <TableCell>
                         <div className="flex flex-wrap items-center gap-2">
-                          <Button size="sm" variant="secondary" onClick={() => handleSelect(n)} disabled={selecting !== null}>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            onClick={() => handleSelect(n)}
+                            disabled={selecting !== null || nodeMode === 'auto'}
+                            title={nodeMode === 'auto' ? 'Auto mode picks the fastest node; switch to Manual to choose' : 'Use this node'}
+                          >
                             {selecting === n.raw_link ? '…' : 'Use'}
                           </Button>
                           <Button
@@ -412,8 +491,8 @@ export default function Proxy() {
                             variant="outline"
                             onClick={() => openEditModal(n)}
                             disabled={updating}
-                            aria-label="Edit share link"
-                            title="Edit share link"
+                            aria-label="Edit node"
+                            title="Edit node"
                           >
                             <Pencil className="h-4 w-4" />
                           </Button>
@@ -466,9 +545,9 @@ export default function Proxy() {
       <Dialog open={!!editModal} onOpenChange={(open) => !open && setEditModal(null)}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Edit share link</DialogTitle>
+            <DialogTitle>Edit node</DialogTitle>
             <DialogDescription>
-              Update the share link for this node. The node will be re-parsed and you may need to select it again.
+              Change the share link or connection pooling. Saving rebuilds the config and restarts the core.
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-2 py-2">
@@ -481,12 +560,33 @@ export default function Proxy() {
               placeholder="vmess://… or vless://…"
             />
           </div>
+          <div className="space-y-2">
+            <Label htmlFor="edit-multiplex">Multiplex (connection pooling)</Label>
+            <Select value={editMultiplex} onValueChange={(v) => setEditMultiplex(v as Multiplex)}>
+              <SelectTrigger id="edit-multiplex" className="w-[160px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {MULTIPLEX_OPTIONS.map((o) => (
+                  <SelectItem key={o.value} value={o.value}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              Reuses a few warm connections to the node instead of a new handshake per request, which cuts
+              latency for many short requests. The node&apos;s server must have multiplex enabled with the same
+              protocol (Xray servers: any value turns on Xray mux). Ignored for XTLS Vision nodes. Can slow large
+              downloads, so measure with Test.
+            </p>
+          </div>
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditModal(null)}>
               Cancel
             </Button>
             <Button onClick={handleUpdateNode} disabled={updating || !editRawLink.trim()}>
-              {updating ? 'Updating…' : 'Update'}
+              {updating ? 'Saving…' : 'Save'}
             </Button>
           </DialogFooter>
         </DialogContent>

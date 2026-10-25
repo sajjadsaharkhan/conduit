@@ -15,7 +15,7 @@ import { cn } from '@/lib/utils'
 import { MODE_INFO, portFor, proxyUrl, type ProxyMode } from '@/lib/proxy-endpoints'
 import { Info, ArrowUp, ArrowDown, Network } from 'lucide-react'
 
-const LOG_POLL_INTERVAL_MS = 1000
+const LOG_POLL_INTERVAL_MS = 3000
 const STATUS_POLL_MS = 5000
 const UPTIME_TICK_MS = 1000
 const LOG_TAIL_OPTIONS = [100, 250, 500, 1000, 2000] as const
@@ -72,7 +72,8 @@ export default function Dashboard() {
   }, [])
 
   useEffect(() => {
-    const id = setInterval(loadStatus, STATUS_POLL_MS)
+    // Skip polls while the tab is hidden: no point loading the backend for a page nobody sees
+    const id = setInterval(() => !document.hidden && loadStatus(), STATUS_POLL_MS)
     return () => clearInterval(id)
   }, [])
 
@@ -110,6 +111,7 @@ export default function Dashboard() {
   useEffect(() => {
     let cancelled = false
     function poll() {
+      if (document.hidden) return
       core.logs(logTail).then((r) => {
         if (!cancelled) setLogLines(r.lines)
       }).catch(() => {})
@@ -261,7 +263,7 @@ export default function Dashboard() {
             <div className="flex items-center gap-1.5">
               <CardTitle className="text-base">Usage</CardTitle>
               <Tooltip
-                content="Connections: open sockets of the core process. Upload/Download: from Xray when core is Xray; sing-box shows —."
+                content="Open sockets: file descriptors held by the core process (about two per proxied connection). Upload/Download: from the Xray stats API or the sing-box Clash API."
                 side="top"
               >
                 <span className="text-muted-foreground cursor-help inline-flex">
@@ -274,7 +276,7 @@ export default function Dashboard() {
             <div className="flex justify-between">
               <span className="text-muted-foreground inline-flex items-center gap-1.5">
                 <Network className="h-3.5 w-3.5" />
-                Connections
+                Open sockets
               </span>
               <span className="font-mono">{data.usage?.connections != null ? data.usage.connections : '—'}</span>
             </div>

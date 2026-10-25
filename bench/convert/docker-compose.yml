@@ -1,0 +1,31 @@
+# Conversion lab: does every share-link shape actually connect, on both cores? Driven by bench/convert/run.sh
+name: conduit-convert
+
+networks:
+  conv:
+    ipam:
+      config:
+        - subnet: 172.29.0.0/24
+
+volumes:
+  shared: {}
+
+services:
+  server:
+    build: {context: ., dockerfile: server.Dockerfile}
+    volumes: [shared:/shared]
+    networks: {conv: {ipv4_address: 172.29.0.10}}
+
+  target:
+    image: nginx:alpine
+    networks: {conv: {ipv4_address: 172.29.0.20}}
+
+  conduit:
+    image: ${CONDUIT_IMAGE:-conduit:bench}
+    networks: {conv: {ipv4_address: 172.29.0.30}}
+
+  tester:
+    image: python:3.11-slim
+    volumes: [shared:/shared:ro, ../:/bench:ro]
+    command: ["sleep", "infinity"]
+    networks: {conv: {ipv4_address: 172.29.0.40}}

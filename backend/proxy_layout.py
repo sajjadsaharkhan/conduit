@@ -34,8 +34,9 @@ HYBRID_SOCKS_PORT = _env_port("CONDUIT_HYBRID_SOCKS_PORT", 1080)
 FULL_SOCKS_PORT = _env_port("CONDUIT_FULL_SOCKS_PORT", 1081)
 XRAY_API_PORT = _env_port("CONDUIT_XRAY_API_PORT", 10085) or 10085
 
+CLASH_API_PORT = 9092  # sing-box Clash API on loopback: live node switching and traffic stats
 # Internal ports used elsewhere in the backend; listed here only to catch collisions.
-_INTERNAL_PORTS = {"sing-box Clash API": 9092, "latency test core": 19099}
+_INTERNAL_PORTS = {"sing-box Clash API": CLASH_API_PORT, "latency test core": 19099}
 
 HTTP_HYBRID_TAG = "http-hybrid"
 HTTP_FULL_TAG = "http-full"
@@ -88,7 +89,9 @@ def proxy_ports() -> Dict[str, Optional[int]]:
 
 
 def _has_proxy_outbound(config: Dict[str, Any]) -> bool:
-    return any(ob.get("tag") == "proxy" for ob in config.get("outbounds", []) if isinstance(ob, dict))
+    """True when "proxy" exists: an outbound/group, or (Xray auto mode) a balancer."""
+    balancers = (config.get("routing") or {}).get("balancers") or []
+    return any(ob.get("tag") == "proxy" for ob in config.get("outbounds", []) + balancers if isinstance(ob, dict))
 
 
 def _enabled_inbounds(include_full: bool):
@@ -108,10 +111,12 @@ def _singbox_inbounds(include_full: bool, username: str, password: str) -> List[
             "tag": tag,
             "listen": "0.0.0.0",
             "listen_port": port,
-            # Sniff TLS/HTTP so routing sees the domain (SNI/Host), not the resolved IP.
-            "sniff": True,
-            "sniff_override_destination": True,
         }
+        if tag not in FULL_TAGS:
+            # Hybrid routing needs the domain (SNI/Host) when a client connects by IP. Full-tunnel ports route
+            # everything to the node anyway, so they skip sniffing; the short timeout limits the wait for
+            # server-first protocols (SSH, SMTP) that never send a first packet.
+            inbound.update({"sniff": True, "sniff_override_destination": True, "sniff_timeout": "50ms"})
         if username:
             inbound["users"] = [{"username": username, "password": password}]
         inbounds.append(inbound)
@@ -143,7 +148,7 @@ def _xray_inbounds(include_full: bool, username: str, password: str, with_api: b
             "port": port,
             "protocol": protocol,
             "settings": settings,
-            "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+            "sniffing": {"enabled": tag not in FULL_TAGS, "destOverride": ["http", "tls"], "routeOnly": False},
         })
     return inbounds
 
@@ -179,15 +184,25 @@ def _ensure_node_server_dns(config: Dict[str, Any]) -> None:
         rules.insert(0, {"outbound": "any", "server": server})
 
 
+def _use_balancer_for_proxy(rules: List[Dict[str, Any]], use_balancer: bool) -> None:
+    """Xray: rules reach "proxy" through outboundTag, or through balancerTag in auto mode."""
+    src, dst = ("outboundTag", "balancerTag") if use_balancer else ("balancerTag", "outboundTag")
+    for rule in rules:
+        if rule.get(src) == "proxy":
+            rule[dst] = rule.pop(src)
+
+
 def apply_proxy_layout(
     config: Dict[str, Any],
     core_type: str,
     proxy_username: str = "",
     proxy_password: str = "",
+    verbose_logs: bool = False,
 ) -> Dict[str, Any]:
     """Rewrite inbounds from env ports and keep the full-tunnel rule first. Mutates and returns config.
 
     Full-tunnel inbounds are only added when a "proxy" outbound exists, so they never fall back to direct.
+    Logging is "warn" unless verbose_logs: "info" logs a line per connection, which costs CPU under load.
     """
     username = (proxy_username or "").strip()
     password = (proxy_password or "") if username else ""
@@ -196,10 +211,13 @@ def apply_proxy_layout(
 
     if core_type == "xray":
         config["inbounds"] = _xray_inbounds(include_full, username, password, with_api="api" in config)
+        config.setdefault("log", {})["loglevel"] = "info" if verbose_logs else "warning"
         rules_key = "routing"
     else:
         config["inbounds"] = _singbox_inbounds(include_full, username, password)
         _ensure_node_server_dns(config)
+        config["log"] = {"level": "info" if verbose_logs else "warn", "timestamp": True}
+        config.setdefault("experimental", {})["clash_api"] = {"external_controller": f"127.0.0.1:{CLASH_API_PORT}"}
         rules_key = "route"
 
     route = config.setdefault(rules_key, {})
@@ -208,5 +226,13 @@ def apply_proxy_layout(
         # Xray's api rule must stay first; the full-tunnel rule goes right after it.
         insert_at = 1 if rules and rules[0].get("inboundTag") == ["api"] else 0
         rules.insert(insert_at, _full_tunnel_rule(core_type, full_tags))
+    if core_type == "xray":
+        for rule in rules:
+            # Older Conduit wrote Xray rules with sing-box's "outbound" key, which Xray ignores
+            if "outbound" in rule and "outboundTag" not in rule and "balancerTag" not in rule:
+                rule["outboundTag"] = rule.pop("outbound")
+            rule.setdefault("type", "field")
+        balancers = route.get("balancers") or []
+        _use_balancer_for_proxy(rules, any(b.get("tag") == "proxy" for b in balancers))
     route["rules"] = rules
     return config

@@ -1,0 +1,12 @@
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [
+    {
+      "port": 8443,
+      "protocol": "vless",
+      "settings": {"clients": [{"id": "6f1c2b0e-6a4e-4a39-9f4f-3c3c1f0b7d11"}], "decryption": "none"},
+      "streamSettings": {"network": "ws", "wsSettings": {"path": "/ws"}}
+    }
+  ],
+  "outbounds": [{"protocol": "freedom"}]
+}

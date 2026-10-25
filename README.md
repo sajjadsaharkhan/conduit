@@ -165,6 +165,28 @@ curl -x socks5h://localhost:1081 https://ifconfig.me
 
 ---
 
+## ⚡ Performance
+
+Built for low latency under heavy load: live node switching without restarts, an **Auto (fastest)** mode that
+picks the node with the lowest real delay, optional per-node **multiplex** (connection pooling), quiet logs and raised
+container limits. `docker-compose.host.yml` runs Conduit with host networking.
+
+See **[docs/performance.md](docs/performance.md)** for what each option does, the server-side settings
+multiplex needs, host tuning (BBR), and the latency benchmark and lab in `bench/`.
+
+---
+
+## 🔁 sing-box and Xray
+
+Nodes are stored as a core-neutral model and converted for whichever core runs: share links (VLESS, VMess, Trojan,
+Shadowsocks incl. 2022 and SIP003 plugins) and pasted sing-box or Xray outbound JSON. Supported on both cores:
+TCP, WebSocket, gRPC, httpupgrade, TLS (SNI, ALPN, uTLS fingerprint) and Reality (incl. XTLS Vision).
+Xray only: xhttp and TCP HTTP-header obfuscation. sing-box only: HTTP/2 transport and Shadowsocks plugins.
+Conduit refuses a node, or a core switch, that the core can't run, and says why. Switching core keeps your
+Domains rules. Note: Xray 25+ dropped `allowInsecure`; use `pcs=` (pinned certificate SHA-256) or sing-box.
+
+---
+
 ## 👨‍💻 Development
 
 Run backend and frontend separately:
@@ -203,8 +225,9 @@ Today the app implements the **whitelist** style. The other modes are on the roa
 | `ADMIN_PASSWORD` | First-time admin password (default: `admin`) |
 | `DATABASE_PATH` | SQLite path (default: `/data/conduit.db`) |
 | `SINGBOX_CONFIG_PATH` | sing-box config path (default: `/data/singbox_config.json`) |
-| `JWT_SECRET` | Secret for auth tokens (optional; auto-generated if unset) |
-| `SINGBOX_CLASH_API` | Set to `1` to enable experimental Clash API for usage stats (if your sing-box build supports it) |
+| `JWT_SECRET` | Secret for auth tokens (optional; if unset, generated once and kept in `/data/.jwt_secret` so logins survive restarts) |
+
+sing-box's Clash API is always on, bound to `127.0.0.1:9092` inside the container (live node switching and traffic stats).
 ---
 
 ## 📄 License

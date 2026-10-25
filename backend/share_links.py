@@ -1,151 +1,209 @@
-"""Parse share links (vmess, vless, trojan, ss) into node dicts."""
+"""Parse share links (vmess, vless, trojan, ss) into one core-neutral node model.
+
+Every parser returns the same keys, so config_generator can build sing-box and Xray outbounds from one
+source of truth instead of translating one core's field names into the other's:
+
+    type            vless | vmess | trojan | shadowsocks
+    raw, remark     the original link and its #name
+    server, server_port
+    uuid            vless/vmess        password   trojan/shadowsocks
+    method          shadowsocks        plugin, plugin_opts   shadowsocks (SIP003)
+    alter_id, vmess_security           vmess
+    flow            vless (e.g. xtls-rprx-vision)
+    network         tcp | ws | grpc | h2 | httpupgrade | xhttp | kcp | quic
+    header_type     none | http (TCP HTTP-header obfuscation)
+    path, host, service_name, mode     transport details (mode: grpc gun/multi, xhttp mode)
+    security        none | tls | reality
+    sni, alpn (list), fingerprint, insecure (bool), pinned_cert_sha256 (Xray's replacement for insecure)
+    reality_public_key, reality_short_id, reality_spider_x
+"""
 import base64
+import binascii
 import json
-import re
-from urllib.parse import urlparse, parse_qs, unquote
-from typing import Dict, Any, Optional
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, unquote, urlsplit
+
+SHARE_LINK_SCHEMES = ("vmess://", "vless://", "trojan://", "ss://")
+NETWORK_ALIASES = {"raw": "tcp", "http": "h2", "splithttp": "xhttp", "": "tcp"}
 
 
-def _decode_base64_padding(s: str) -> bytes:
-    pad = 4 - len(s) % 4
-    if pad != 4:
-        s += "=" * pad
-    return base64.standard_b64decode(s)
+def is_share_link(text: str) -> bool:
+    return (text or "").strip().lower().startswith(SHARE_LINK_SCHEMES)
 
 
-def parse_vmess(link: str) -> Optional[Dict[str, Any]]:
-    """Parse vmess:// link (base64 json after scheme). Decoded JSON may have 'type' (header/stream); we keep protocol as 'vmess'."""
-    if not link.strip().lower().startswith("vmess://"):
-        return None
-    try:
-        b = link.strip()[8:]
-        decoded = _decode_base64_padding(b).decode("utf-8", errors="replace")
-        data = json.loads(decoded)
-        return {**data, "type": "vmess", "raw": link}
-    except Exception:
-        return None
+def _b64decode(s: str) -> bytes:
+    """Decode standard or URL-safe base64, with or without padding."""
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s, validate=True)
+
+
+def _first(params: Dict[str, List[str]], *keys: str, default: str = "") -> str:
+    for key in keys:
+        values = params.get(key)
+        if values and values[0] != "":
+            return values[0].strip()
+    return default
+
+
+def _truthy(value: Any) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes")
+
+
+def _split_list(value: str) -> List[str]:
+    return [v.strip() for v in (value or "").split(",") if v.strip()]
+
+
+def _host_port(netloc: str, default_port: int) -> tuple:
+    """host:port with IPv6 brackets removed: [2001:db8::1]:443 -> ("2001:db8::1", 443)."""
+    if netloc.startswith("["):
+        host, _, rest = netloc[1:].partition("]")
+        port = rest.lstrip(":")
+    elif netloc.count(":") == 1:
+        host, port = netloc.rsplit(":", 1)
+    else:
+        host, port = netloc, ""
+    return host, int(port) if port else default_port
+
+
+def _transport_and_tls(params: Dict[str, List[str]], default_security: str = "none") -> Dict[str, Any]:
+    """Shared v2rayN/Xray query parameters (vless, trojan)."""
+    network = _first(params, "type", "network").lower()
+    network = NETWORK_ALIASES.get(network, network)
+    security = _first(params, "security", default=default_security).lower()
+    if security in ("xtls", "ssl"):
+        security = "tls"
+    node: Dict[str, Any] = {
+        "network": network,
+        "header_type": _first(params, "headerType", default="none").lower(),
+        "path": _first(params, "path", default="/"),
+        "host": _first(params, "host"),
+        "service_name": _first(params, "serviceName", "path") if network == "grpc" else "",
+        "mode": _first(params, "mode"),
+        "security": security or "none",
+        "sni": _first(params, "sni", "peer"),
+        "alpn": _split_list(_first(params, "alpn")),
+        "fingerprint": _first(params, "fp", "fingerprint"),
+        "insecure": _truthy(_first(params, "allowInsecure", "insecure", default="0")),
+        "pinned_cert_sha256": _first(params, "pcs", "pinnedPeerCertSha256"),
+        "reality_public_key": _first(params, "pbk", "publicKey"),
+        "reality_short_id": _first(params, "sid", "shortId"),
+        "reality_spider_x": _first(params, "spx", "spiderX"),
+    }
+    if network == "grpc" and node["path"] == node["service_name"]:
+        node["path"] = "/"
+    return node
+
+
+def _parse_uri(link: str, scheme_len: int, default_port: int = 443):
+    rest = link[scheme_len:]
+    rest, _, fragment = rest.partition("#")
+    netloc, _, query = rest.partition("?")
+    netloc = netloc.rstrip("/")
+    userinfo, _, hostport = netloc.rpartition("@")
+    host, port = _host_port(hostport, default_port)
+    return unquote(userinfo), host, port, parse_qs(query, keep_blank_values=True), unquote(fragment)
 
 
 def parse_vless(link: str) -> Optional[Dict[str, Any]]:
-    """Parse vless:// uuid@host:port?params#remark."""
-    if not link.strip().lower().startswith("vless://"):
-        return None
+    """vless://uuid@host:port?type=ws&security=tls&...#remark"""
     try:
-        rest = link.strip()[8:]
-        if "#" in rest:
-            rest, fragment = rest.rsplit("#", 1)
-            remark = unquote(fragment)
-        else:
-            remark = ""
-        if "?" in rest:
-            netloc, qs = rest.split("?", 1)
-            params = parse_qs(qs)
-        else:
-            netloc, params = rest, {}
-        uuid = netloc.split("@")[0]
-        host_port = netloc.split("@", 1)[1]
-        if ":" in host_port:
-            host = host_port.rsplit(":", 1)[0]
-            port = int(host_port.rsplit(":", 1)[1])
-        else:
-            host = host_port
-            port = 443
-        out = {
-            "type": "vless",
-            "raw": link,
-            "uuid": uuid,
-            "server": host,
-            "server_port": port,
-            "remark": remark,
-            "params": params,
+        uuid, host, port, params, remark = _parse_uri(link.strip(), 8)
+        if not uuid or not host:
+            return None
+        return {
+            "type": "vless", "raw": link, "remark": remark, "server": host, "server_port": port,
+            "uuid": uuid, "flow": _first(params, "flow"),
+            **_transport_and_tls(params),
         }
-        return out
-    except Exception:
+    except (ValueError, IndexError):
         return None
 
 
 def parse_trojan(link: str) -> Optional[Dict[str, Any]]:
-    """Parse trojan:// password@host:port?params#remark."""
-    if not link.strip().lower().startswith("trojan://"):
-        return None
+    """trojan://password@host:port?sni=...#remark. Trojan runs over TLS unless security=none."""
     try:
-        rest = link.strip()[9:]
-        if "#" in rest:
-            rest, fragment = rest.rsplit("#", 1)
-            remark = unquote(fragment)
-        else:
-            remark = ""
-        if "?" in rest:
-            netloc, qs = rest.split("?", 1)
-            params = parse_qs(qs)
-        else:
-            netloc, params = rest, {}
-        password = netloc.split("@")[0]
-        host_port = netloc.split("@", 1)[1]
-        if ":" in host_port:
-            host = host_port.rsplit(":", 1)[0]
-            port = int(host_port.rsplit(":", 1)[1])
-        else:
-            host = host_port
-            port = 443
+        password, host, port, params, remark = _parse_uri(link.strip(), 9)
+        if not password or not host:
+            return None
         return {
-            "type": "trojan",
-            "raw": link,
-            "password": password,
-            "server": host,
-            "server_port": port,
-            "remark": remark,
-            "params": params,
+            "type": "trojan", "raw": link, "remark": remark, "server": host, "server_port": port,
+            "password": password, "flow": "",
+            **_transport_and_tls(params, default_security="tls"),
         }
-    except Exception:
+    except (ValueError, IndexError):
         return None
+
+
+def parse_vmess(link: str) -> Optional[Dict[str, Any]]:
+    """vmess://base64(JSON) in the v2rayN format (add, port, id, aid, scy, net, type, host, path, tls, sni, alpn, fp)."""
+    try:
+        data = json.loads(_b64decode(link.strip()[8:]).decode("utf-8", errors="replace"))
+    except (ValueError, binascii.Error):
+        return None
+    if not isinstance(data, dict) or not data.get("add") or not data.get("id"):
+        return None
+    network = NETWORK_ALIASES.get(str(data.get("net") or "").lower(), str(data.get("net") or "").lower())
+    header = str(data.get("type") or "none").lower()  # header type for tcp; grpc mode (gun/multi) for grpc
+    tls = str(data.get("tls") or "").lower()
+    return {
+        "type": "vmess", "raw": link, "remark": str(data.get("ps") or ""),
+        "server": str(data["add"]).strip("[]"), "server_port": int(data.get("port") or 443),
+        "uuid": str(data["id"]), "alter_id": int(data.get("aid") or 0),
+        "vmess_security": str(data.get("scy") or "auto"), "flow": "",
+        "network": network,
+        "header_type": header if network == "tcp" else "none",
+        "path": str(data.get("path") or "/") if network != "grpc" else "/",
+        "host": str(data.get("host") or ""),
+        "service_name": str(data.get("path") or "") if network == "grpc" else "",
+        "mode": header if network == "grpc" else "",
+        "security": "reality" if tls == "reality" else "tls" if tls == "tls" else "none",
+        "sni": str(data.get("sni") or ""),
+        "alpn": _split_list(str(data.get("alpn") or "")),
+        "fingerprint": str(data.get("fp") or ""),
+        "insecure": _truthy(data.get("allowInsecure") or data.get("skip-cert-verify") or "0"),
+        "pinned_cert_sha256": str(data.get("pcs") or ""),
+        "reality_public_key": str(data.get("pbk") or ""),
+        "reality_short_id": str(data.get("sid") or ""),
+        "reality_spider_x": str(data.get("spx") or ""),
+    }
 
 
 def parse_ss(link: str) -> Optional[Dict[str, Any]]:
-    """Parse ss:// [method:password]@host:port#remark or ss:// base64(method:password)@host:port#remark."""
-    if not link.strip().lower().startswith("ss://"):
-        return None
+    """Shadowsocks, all common forms:
+    SIP002   ss://base64url(method:password)@host:port/?plugin=...#tag
+             ss://method:percent-encoded-password@host:port#tag   (Shadowsocks 2022 keys)
+    legacy   ss://base64(method:password@host:port)#tag
+    """
     try:
-        rest = link.strip()[5:]
-        if "#" in rest:
-            rest, fragment = rest.rsplit("#", 1)
-            remark = unquote(fragment)
-        else:
-            remark = ""
-        if rest.startswith("ss://") or "://" in rest:
+        rest, _, fragment = link.strip()[5:].partition("#")
+        remark = unquote(fragment)
+        main, _, query = rest.partition("?")
+        main = main.rstrip("/")
+        if "@" not in main:  # legacy: everything base64-encoded
+            main = _b64decode(unquote(main)).decode("utf-8")
+        userinfo, _, hostport = main.rpartition("@")
+        userinfo = unquote(userinfo)
+        if ":" not in userinfo:
+            userinfo = _b64decode(userinfo).decode("utf-8")
+        method, _, password = userinfo.partition(":")
+        host, port = _host_port(hostport, 8388)
+        plugin, _, plugin_opts = _first(parse_qs(query), "plugin").partition(";")
+        if not method or not host:
             return None
-        if "@" in rest:
-            userinfo, host_port = rest.split("@", 1)
-            try:
-                decoded = _decode_base64_padding(userinfo).decode("utf-8", errors="replace")
-                method, password = decoded.split(":", 1)
-            except Exception:
-                method, _, password = userinfo.partition(":")
-            if ":" in host_port:
-                host = host_port.rsplit(":", 1)[0]
-                port = int(host_port.rsplit(":", 1)[1])
-            else:
-                host = host_port
-                port = 8388
-            return {
-                "type": "shadowsocks",
-                "raw": link,
-                "method": method,
-                "password": password,
-                "server": host,
-                "server_port": port,
-                "remark": remark,
-            }
-    except Exception:
+        return {
+            "type": "shadowsocks", "raw": link, "remark": remark, "server": host, "server_port": port,
+            "method": method.lower(), "password": password,
+            "plugin": plugin, "plugin_opts": plugin_opts,
+            "network": "tcp", "security": "none",
+        }
+    except (ValueError, UnicodeDecodeError, binascii.Error):
         return None
-    return None
 
 
 def parse_share_link(link: str) -> Optional[Dict[str, Any]]:
-    """Dispatch to vmess/vless/trojan/ss parser."""
-    link = link.strip()
-    if not link:
-        return None
+    """Dispatch to the vmess/vless/trojan/ss parser. None when the link can't be parsed."""
+    link = (link or "").strip()
     lower = link.lower()
     if lower.startswith("vmess://"):
         return parse_vmess(link)
