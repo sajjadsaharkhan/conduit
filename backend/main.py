@@ -143,8 +143,16 @@ async def lifespan(app: FastAPI):
     # Run one-time migration from DB to config file
     await migrate_db_to_config()
     async with db_connection() as conn:
-        core_type = await _get_setting(await conn.cursor(), "core_type", "sing-box")
+        cursor = await conn.cursor()
+        core_type = await _get_setting(cursor, "core_type", "sing-box")
+        selected_raw = (await _get_setting(cursor, "selected_node_raw", "")).strip()
     await _sync_config_layout(core_type)
+    # Start the core with the active node: since subscriptions were removed, nothing else starts it at boot
+    if selected_raw:
+        try:
+            await _apply_node_config(selected_raw)
+        except ValueError:
+            pass  # node no longer parses; the UI shows the core as stopped
 
     yield
     # shutdown: stop core?
