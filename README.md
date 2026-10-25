@@ -181,7 +181,8 @@ multiplex needs, host tuning (BBR), and the latency benchmark and lab in `bench/
 Nodes are stored as a core-neutral model and converted for whichever core runs: share links (VLESS, VMess, Trojan,
 Shadowsocks incl. 2022 and SIP003 plugins) and pasted sing-box or Xray outbound JSON. Supported on both cores:
 TCP, WebSocket, gRPC, httpupgrade, TLS (SNI, ALPN, uTLS fingerprint) and Reality (incl. XTLS Vision).
-Xray only: xhttp and TCP HTTP-header obfuscation. sing-box only: HTTP/2 transport and Shadowsocks plugins.
+Xray only: xhttp (incl. its `extra` settings), VLESS Encryption (`encryption=mlkem768x25519plus...`) and TCP
+HTTP-header obfuscation. sing-box only: HTTP/2 transport and Shadowsocks plugins.
 Conduit refuses a node, or a core switch, that the core can't run, and says why. Switching core keeps your
 Domains rules. Note: Xray 25+ dropped `allowInsecure`; use `pcs=` (pinned certificate SHA-256) or sing-box.
 

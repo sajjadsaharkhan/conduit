@@ -6,12 +6,16 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
   -subj "/CN=node.lab" -addext "subjectAltName=DNS:node.lab" \
   -keyout /shared/key.pem -out /shared/cert.pem 2>/dev/null
 xray x25519 > /shared/reality.txt
+xray vlessenc > /shared/vlessenc.txt
 python3 - <<'PY'
 import json, re
 txt = open("/shared/reality.txt").read()
 priv = re.search(r"(?i)private\s*key:\s*(\S+)", txt).group(1)
 pub = re.search(r"(?i)(public\s*key|password):\s*(\S+)", txt).group(2)
 open("/shared/reality.pub", "w").write(pub)
+pairs = re.findall(r'"decryption":\s*"([^"]+)"[\s\S]*?"encryption":\s*"([^"]+)"', open("/shared/vlessenc.txt").read())
+vless_dec, vless_enc = pairs[-1]  # the ML-KEM-768 (post-quantum) pair
+open("/shared/vlessenc.enc", "w").write(vless_enc)
 U = "6f1c2b0e-6a4e-4a39-9f4f-3c3c1f0b7d11"
 tls = {"certificates": [{"certificateFile": "/shared/cert.pem", "keyFile": "/shared/key.pem"}]}
 def vless(flow=""):
@@ -31,6 +35,7 @@ inb = [
     (9009, "shadowsocks", {"method": "2022-blake3-aes-256-gcm", "password": "YctPZ6U7xPPcU+gp3u+0tx/tRizJN9K8y+uKlW2qjlI=", "network": "tcp,udp"}, None),
     (9010, "vless", vless(), {"network": "httpupgrade", "httpupgradeSettings": {"path": "/up"}}),
     (9011, "vless", vless(), {"network": "xhttp", "xhttpSettings": {"path": "/x"}}),
+    (9012, "vless", {"clients": [{"id": U}], "decryption": vless_dec}, {"network": "xhttp", "xhttpSettings": {"path": "/xe", "mode": "stream-one"}}),
 ]
 inbounds = []
 for port, proto, settings, stream in inb:

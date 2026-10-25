@@ -59,6 +59,9 @@ from proxy_layout import (
 )
 
 
+DEFAULT_TEST_URL = "https://www.gstatic.com/generate_204"
+
+
 # --- Auth dependency ---
 async def get_current_user(authorization: str | None = Header(None)) -> str:
     token = ""
@@ -148,6 +151,7 @@ async def lifespan(app: FastAPI):
 
     # Run one-time migration from DB to config file
     await migrate_db_to_config()
+    await _import_config_only_proxy()
     # Bring the config in line with env ports and the node list, and start the core: nothing else starts it at boot
     try:
         await _rebuild_core_config(start="always")
@@ -195,7 +199,7 @@ async def get_settings(username: str = Depends(get_current_user)):
     return {
         "core_type": settings.get("core_type", "sing-box"),
         "selected_node_raw": settings.get("selected_node_raw", ""),
-        "latency_test_domain": settings.get("latency_test_domain", "https://www.gstatic.com/generate_204"),
+        "latency_test_domain": (settings.get("latency_test_domain") or "").strip() or DEFAULT_TEST_URL,
         "proxy_display_host": (settings.get("proxy_display_host") or "127.0.0.1").strip() or "127.0.0.1",
         "proxy_username": (settings.get("proxy_username") or "").strip() or "",
         "proxy_password": settings.get("proxy_password") or "",
@@ -521,6 +525,43 @@ def _clash_current_node() -> str | None:
         return None
 
 
+async def _import_config_only_proxy() -> None:
+    """Keep a working node that only exists in an old config file.
+
+    Before the node list drove the config, "proxy" could be edited in the JSON editor without being in the
+    list. Rebuilding from the list would drop it, so add it to the list (as pasted JSON) and make it active
+    when the active selection doesn't point at a stored node.
+    """
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        core_type = await _get_setting(cursor, "core_type", "sing-box")
+        selected_raw = (await _get_setting(cursor, "selected_node_raw", "")).strip()
+        await cursor.execute("SELECT 1 FROM nodes WHERE raw_link = ?", (selected_raw,))
+        if selected_raw and await cursor.fetchone():
+            return
+        try:
+            config = get_config_manager(core_type).read_config()
+        except (FileNotFoundError, ValueError):
+            return
+        proxy = next((o for o in config.get("outbounds", []) if isinstance(o, dict) and o.get("tag") == "proxy"), None)
+        if not proxy or (proxy.get("type") or proxy.get("protocol")) not in PROTOCOLS:
+            return  # absent, or already a selector/urltest group built from the list
+        node = {k: v for k, v in proxy.items() if k != "tag"}
+        try:
+            to_model(node)
+        except ValueError:
+            return
+        raw = json.dumps(node, ensure_ascii=False)[:200]
+        node["raw"] = raw
+        await cursor.execute(
+            """INSERT INTO nodes (source, raw_link, parsed_json, name, created_at) VALUES ('manual', ?, ?, ?, datetime('now'))
+               ON CONFLICT(raw_link) DO NOTHING""",
+            (raw, json.dumps(node, ensure_ascii=False), "Imported from previous config"),
+        )
+        await cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)", (raw,))
+        await conn.commit()
+
+
 async def _rebuild_core_config(start: str = "if_running") -> None:
     """Rebuild node outbounds from the node list and settings, write the config, and (re)start the core.
 
@@ -533,7 +574,7 @@ async def _rebuild_core_config(start: str = "if_running") -> None:
         core_type = await _get_setting(cursor, "core_type", "sing-box")
         selected_raw = (await _get_setting(cursor, "selected_node_raw", "")).strip()
         mode = await _get_setting(cursor, "node_mode", "manual")
-        test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip() or "https://www.gstatic.com/generate_204"
+        test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip() or DEFAULT_TEST_URL
         tcp_fast_open = await _get_setting(cursor, "tcp_fast_open", "false") == "true"
         await cursor.execute("SELECT id, raw_link, parsed_json, multiplex FROM nodes ORDER BY id")
         rows = await cursor.fetchall()
@@ -584,7 +625,8 @@ async def node_latency_test(
             parsed = None
         if not parsed:
             parsed = parse_share_link(raw_link)
-        test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip()
+        # Same default the UI shows; databases from older versions never stored one
+        test_url = (await _get_setting(cursor, "latency_test_domain", "")).strip() or DEFAULT_TEST_URL
         core_type = await _get_setting(cursor, "core_type", "sing-box")
     if not parsed:
         raise HTTPException(status_code=400, detail="Invalid or unknown node")

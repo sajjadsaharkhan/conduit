@@ -21,6 +21,8 @@ SS2022_KEY = "YctPZ6U7xPPcU+gp3u+0tx/tRizJN9K8y+uKlW2qjlI="
 
 cert_hash = hashlib.sha256(ssl.PEM_cert_to_DER_cert(open("/shared/cert.pem").read())).hexdigest()
 reality_pub = open("/shared/reality.pub").read().strip()
+vless_enc = open("/shared/vlessenc.enc").read().strip()
+XHTTP_EXTRA = urllib.parse.quote(json.dumps({"xPaddingBytes": "100-1000"}), safe="")
 TLS = f"sni=node.lab&allowInsecure=1&pcs={cert_hash}"
 
 
@@ -41,6 +43,7 @@ CASES = [
     ("ss 2022 (plain userinfo)", f"ss://2022-blake3-aes-256-gcm:{urllib.parse.quote(SS2022_KEY, safe='')}@{SERVER}:9009#c9", "ok", "ok"),
     ("vless httpupgrade", f"vless://{U}@{SERVER}:9010?type=httpupgrade&path=%2Fup&security=none#c10", "ok", "ok"),
     ("vless xhttp", f"vless://{U}@{SERVER}:9011?type=xhttp&path=%2Fx&security=none&mode=auto#c11", "rejected", "ok"),
+    ("vless encryption + xhttp extra", f"vless://{U}@{SERVER}:9012?encryption={urllib.parse.quote(vless_enc, safe='')}&security=none&type=xhttp&host=soft98.ir&path=%2Fxe&mode=stream-one&extra={XHTTP_EXTRA}#c12", "rejected", "ok"),
 ]
 
 
