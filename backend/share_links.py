@@ -1,10 +1,9 @@
-"""Fetch and parse subscription links (base64) and share links (vmess, vless, trojan, ss)."""
+"""Parse share links (vmess, vless, trojan, ss) into node dicts."""
 import base64
 import json
 import re
 from urllib.parse import urlparse, parse_qs, unquote
-from typing import List, Dict, Any, Optional
-import httpx
+from typing import Dict, Any, Optional
 
 
 def _decode_base64_padding(s: str) -> bytes:
@@ -157,25 +156,3 @@ def parse_share_link(link: str) -> Optional[Dict[str, Any]]:
     if lower.startswith("ss://"):
         return parse_ss(link)
     return None
-
-
-async def fetch_subscription(url: str, timeout: float = 15.0) -> List[Dict[str, Any]]:
-    """
-    Fetch subscription URL (GET), decode base64, split by newline, parse each share link.
-    Returns list of parsed node dicts (with 'type', 'raw', and protocol-specific fields).
-    """
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.get(url)
-        resp.raise_for_status()
-        raw = resp.text.strip()
-    try:
-        decoded = _decode_base64_padding(raw).decode("utf-8", errors="replace")
-    except Exception:
-        decoded = raw
-    lines = [ln.strip() for ln in decoded.replace("\r", "").split("\n") if ln.strip()]
-    nodes = []
-    for line in lines:
-        parsed = parse_share_link(line)
-        if parsed:
-            nodes.append(parsed)
-    return nodes

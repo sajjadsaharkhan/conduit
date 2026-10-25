@@ -4,7 +4,6 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { Checkbox } from '@/components/ui/checkbox'
 import {
   Select,
   SelectContent,
@@ -53,9 +52,6 @@ export default function Core() {
 
   // Settings state
   const [coreType, setCoreType] = useState<'sing-box' | 'xray'>('sing-box')
-  const [refreshInterval, setRefreshInterval] = useState(1)
-  const [autoSwitchBest, setAutoSwitchBest] = useState(true)
-  const [settingsLoading, setSettingsLoading] = useState(false)
   const [settingsSaveMsg, setSettingsSaveMsg] = useState<string | null>(null)
 
   // Config editing state
@@ -98,8 +94,6 @@ export default function Core() {
   function loadSettings() {
     settingsApi.get().then((s) => {
       if (s.core_type === 'xray' || s.core_type === 'sing-box') setCoreType(s.core_type)
-      setRefreshInterval(s.refresh_interval_minutes)
-      setAutoSwitchBest(s.auto_switch_best)
       setLatencyTestDomain(s.latency_test_domain || '')
     }).catch(() => {})
   }
@@ -211,23 +205,6 @@ export default function Core() {
       load()
     } catch (e) {
       setSettingsSaveMsg(e instanceof Error ? e.message : 'Failed to update core type')
-    }
-  }
-
-  async function handleSaveRefreshConfig() {
-    setSettingsLoading(true)
-    setSettingsSaveMsg(null)
-    try {
-      await settingsApi.update({
-        refresh_interval_minutes: Math.max(1, Math.min(1440, refreshInterval)),
-        auto_switch_best: autoSwitchBest,
-      })
-      setSettingsSaveMsg('Saved.')
-      loadSettings()
-    } catch (e) {
-      setSettingsSaveMsg(e instanceof Error ? e.message : 'Save failed')
-    } finally {
-      setSettingsLoading(false)
     }
   }
 
@@ -417,7 +394,7 @@ export default function Core() {
       )}
 
       {/* One row: same-height panels */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-stretch">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
         {/* Core control */}
         <div className="flex min-h-0">
           <Card className="flex h-full w-full flex-col">
@@ -477,7 +454,7 @@ export default function Core() {
                   Latency test
                 </CardTitle>
                 <Tooltip
-                  content="Download the test URL via the proxy to measure real latency (time to first byte) and download speed. Save the URL first, then run the test. The request goes through your current proxy (HTTP on port 8080)."
+                  content="Download the test URL via the proxy to measure real latency (time to first byte) and download speed. Save the URL first, then run the test. The request goes through the full-tunnel HTTP port, so it always measures the selected node."
                   side="top"
                 >
                   <span className="shrink-0 text-muted-foreground cursor-help inline-flex">
@@ -568,58 +545,6 @@ export default function Core() {
                     )}
                   </div>
                 </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Refresh & switch */}
-        <div className="flex min-h-0">
-          <Card className="flex h-full w-full flex-col">
-            <CardHeader className="shrink-0 flex flex-row items-start justify-between gap-2 space-y-0 pb-2">
-              <div className="flex items-center gap-1.5 min-w-0">
-                <CardTitle>Refresh &amp; switch</CardTitle>
-                <Tooltip
-                  content="How often to refresh the subscription and whether to auto-switch to the best node by latency."
-                  side="top"
-                >
-                  <span className="shrink-0 text-muted-foreground cursor-help inline-flex">
-                    <Info className="h-4 w-4" />
-                  </span>
-                </Tooltip>
-              </div>
-              <Button size="sm" onClick={handleSaveRefreshConfig} disabled={settingsLoading} className="shrink-0">
-                {settingsLoading ? 'Saving…' : 'Save'}
-              </Button>
-            </CardHeader>
-            <CardContent className="flex-1 space-y-4 min-h-0">
-              <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 items-center">
-                <Label htmlFor="refresh-interval">Interval (min)</Label>
-                <div />
-                <Input
-                  id="refresh-interval"
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={refreshInterval}
-                  onChange={(e) => setRefreshInterval(Number(e.target.value) || 1)}
-                  className="w-24"
-                />
-                <div className="flex items-center gap-2">
-                  <Checkbox
-                    id="auto-switch"
-                    checked={autoSwitchBest}
-                    onCheckedChange={setAutoSwitchBest}
-                  />
-                  <Label htmlFor="auto-switch" className="cursor-pointer text-sm font-normal">
-                    Auto switch to best node
-                  </Label>
-                </div>
-              </div>
-              {settingsSaveMsg && (settingsSaveMsg === 'Saved.' || settingsSaveMsg === 'Save failed') && (
-                <p className={`text-sm ${settingsSaveMsg === 'Saved.' ? 'text-emerald-600' : 'text-destructive'}`}>
-                  {settingsSaveMsg}
-                </p>
               )}
             </CardContent>
           </Card>

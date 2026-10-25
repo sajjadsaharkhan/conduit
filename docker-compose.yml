@@ -1,28 +1,28 @@
+# Conduit - build locally. Ports and admin login come from .env (see .env.example).
 services:
-  backend:
+  conduit:
     build: .
-    container_name: conduit_backend
+    container_name: conduit
     ports:
-      - "8000:8000"   # API
-      - "8080:8080"   # HTTP proxy
-      - "1080:1080"   # SOCKS5 proxy
+      - "${CONDUIT_WEB_PORT:-7782}:${CONDUIT_WEB_PORT:-7782}"                    # Web UI + API
+      - "${CONDUIT_HYBRID_HTTP_PORT:-8080}:${CONDUIT_HYBRID_HTTP_PORT:-8080}"    # HTTP proxy (hybrid)
+      - "${CONDUIT_FULL_HTTP_PORT:-8081}:${CONDUIT_FULL_HTTP_PORT:-8081}"        # HTTP proxy (full tunnel)
+      - "${CONDUIT_HYBRID_SOCKS_PORT:-1080}:${CONDUIT_HYBRID_SOCKS_PORT:-1080}"  # SOCKS5 (hybrid)
+      - "${CONDUIT_FULL_SOCKS_PORT:-1081}:${CONDUIT_FULL_SOCKS_PORT:-1081}"      # SOCKS5 (full tunnel)
     volumes:
       - conduit_data:/data
       - ./backend:/app/backend   # Mount backend code for development
     environment:
-      - ADMIN_USERNAME=admin
-      - ADMIN_PASSWORD=admin
+      - CONDUIT_WEB_PORT=${CONDUIT_WEB_PORT:-7782}
+      - CONDUIT_API_PORT=${CONDUIT_API_PORT:-8000}
+      - CONDUIT_HYBRID_HTTP_PORT=${CONDUIT_HYBRID_HTTP_PORT:-8080}
+      - CONDUIT_FULL_HTTP_PORT=${CONDUIT_FULL_HTTP_PORT:-8081}
+      - CONDUIT_HYBRID_SOCKS_PORT=${CONDUIT_HYBRID_SOCKS_PORT:-1080}
+      - CONDUIT_FULL_SOCKS_PORT=${CONDUIT_FULL_SOCKS_PORT:-1081}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       - DATABASE_PATH=/data/conduit.db
       - SINGBOX_CONFIG_PATH=/data/singbox_config.json
-    restart: unless-stopped
-
-  frontend:
-    build: ./frontend
-    container_name: conduit_frontend
-    ports:
-      - "80:80"       # Web UI
-    depends_on:
-      - backend
     restart: unless-stopped
 
 volumes:

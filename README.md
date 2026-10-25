@@ -1,6 +1,6 @@
 # Conduit
 
-**A v2ray / Xray / sing-box proxy client for your server or private network.** Run it as a Docker service, manage subscriptions and nodes via a web UI, and use HTTP or SOCKS5 proxy only for the domains you choose—so your servers can bypass filters and sanctions without changing desktop or mobile clients.
+**A v2ray / Xray / sing-box proxy client for your server or private network.** Run it as a Docker service, manage your nodes via a web UI, and use HTTP or SOCKS5 proxy only for the domains you choose—so your servers can bypass filters and sanctions without changing desktop or mobile clients.
 
 <p align="center">
   <a href="https://github.com/sajjadsaharkhan/conduit/actions/workflows/docker-build.yml">
@@ -18,7 +18,7 @@
 
 ## 📖 Short description
 
-**Conduit** is a **server-side proxy client** for [v2ray](https://www.v2ray.com/), [Xray](https://github.com/XTLS/Xray-core), and [sing-box](https://github.com/SagerNet/sing-box). It fetches subscription links, picks the best node by latency, and exposes **HTTP** and **SOCKS5** proxies. You configure which domains use the proxy in a web UI; all other traffic stays direct. Ideal for servers in restricted regions that need reliable outbound access.
+**Conduit** is a **server-side proxy client** for [v2ray](https://www.v2ray.com/), [Xray](https://github.com/XTLS/Xray-core), and [sing-box](https://github.com/SagerNet/sing-box). You add your nodes (share links or outbound JSON), pick the one to use, and it exposes **HTTP** and **SOCKS5** proxies. You configure which domains use the proxy in a web UI; all other traffic stays direct. Ideal for servers in restricted regions that need reliable outbound access.
 
 ---
 
@@ -36,12 +36,13 @@ The catch: their **clients are built for desktop and mobile**. On **servers** (V
 
 | What you get | How it works |
 |--------------|--------------|
-| 🐳 **One Docker stack** | Backend + Web UI; no manual core config. |
-| 🔗 **Subscription → best node** | Fetches subscription URL, parses VMess/VLESS/Trojan/Shadowsocks, picks lowest-latency node. |
-| 🌐 **HTTP (8080) & SOCKS5 (1080)** | Standard proxy ports; only traffic to **domains you add** goes through the proxy—everything else is **direct**. |
+| 🐳 **One Docker image** | Web UI, API and core in one container; no manual core config. |
+| 🔗 **Your nodes** | Add VMess/VLESS/Trojan/Shadowsocks share links or outbound JSON, ping/test them, and choose which one is active. |
+| 🌐 **Hybrid ports (8080 / 1080)** | HTTP and SOCKS5; only traffic to **domains you add** goes through the proxy—everything else is **direct**. |
+| 🛡️ **Full-tunnel ports (8081 / 1081)** | HTTP and SOCKS5; **everything** goes through the selected node, Domains rules are ignored. |
 | ⚙️ **sing-box or Xray** | Choose in settings; no hand-editing JSON or running core binaries yourself. |
 
-So: **one service, one proxy endpoint, domain-based routing, and a simple UI.** Your server uses it like any other HTTP/SOCKS proxy.
+So: **one service, a hybrid and a full-tunnel endpoint, domain-based routing, and a simple UI.** Your server uses it like any other HTTP/SOCKS proxy.
 
 ---
 
@@ -55,11 +56,10 @@ A **conduit** is a channel that carries something from one place to another. Her
 
 | Feature | Description |
 |--------|-------------|
-| 🔌 **HTTP & SOCKS5 proxies** | Ports **8080** (HTTP) and **1080** (SOCKS5) inside the backend container; optional proxy authentication. |
-| 🖥️ **Web UI** | Admin panel (login with username/password) to manage subscription, nodes, domains, and settings; served on port 80. |
-| 📡 **Subscription** | Paste a subscription URL; the app fetches it every minute, parses nodes (VMess, VLESS, Trojan, Shadowsocks), runs latency checks, and uses the best node. |
+| 🔌 **HTTP & SOCKS5 proxies** | Hybrid on **8080** / **1080**, full tunnel on **8081** / **1081**; all ports set by env vars; optional proxy authentication. |
+| 🖥️ **Web UI** | Admin panel (login with username/password) to manage nodes, domains, and settings; served on port 7782 (nginx, together with `/api`). |
 | 🎚️ **Domain-based routing** | Only traffic to domains you add uses the proxy; all other traffic is direct (bypass). |
-| 📋 **Manual config** | Paste a single share link (e.g. `vless://...`) or JSON to use without a subscription. |
+| 📋 **Node list** | Keep several nodes; Ping (TCP from the server) and Test (real latency/speed through the node) help you pick. Switching only restarts the core when you choose. |
 | 🔀 **Dual core support** | **sing-box** or **Xray**; choose in settings. |
 | 💾 **SQLite** | All settings and data in `/data` (persisted via Docker volume). |
 
@@ -76,7 +76,6 @@ A **conduit** is a channel that carries something from one place to another. Her
 
 - **[Python](https://www.python.org/)** · **[FastAPI](https://fastapi.tiangolo.com/)** · **[Uvicorn](https://www.uvicorn.org/)** — API server.
 - **[SQLite](https://www.sqlite.org/)** via [aiosqlite](https://github.com/omnilib/aiosqlite) — Persistent storage.
-- **[APScheduler](https://apscheduler.readthedocs.io/)** — Subscription refresh and scheduled tasks.
 
 ### Frontend & design system
 
@@ -99,15 +98,13 @@ The UI is built with a **component-based design system**: Radix primitives for b
 Use the images published to **GitHub Container Registry** (no build on your machine):
 
 ```bash
-# Pull images
-docker pull ghcr.io/sajjadsaharkhan/conduit/backend:main
-docker pull ghcr.io/sajjadsaharkhan/conduit/frontend:main
-
-# Run with deploy compose
+cp .env.example .env   # optional: change ports or the initial admin login
 docker compose -f docker-compose.deploy.yml up -d
 ```
 
-Then open **http://localhost** (default login: `admin` / `admin`). Configure subscription and domains in the UI. Use the proxy at **HTTP** `localhost:8080` and **SOCKS5** `localhost:1080` for the domains you added.
+Then open **http://localhost:7782** (default login: `admin` / `admin`). Add a node on the Proxy page and configure domains in the UI. Use the hybrid proxy at **HTTP** `localhost:8080` / **SOCKS5** `localhost:1080`, or the full tunnel at **HTTP** `localhost:8081` / **SOCKS5** `localhost:1081`.
+
+> Upgrading from the two-image setup (`conduit/backend` + `conduit/frontend`): use the new compose file. The image is now `ghcr.io/sajjadsaharkhan/conduit:main` and the UI moved from port 80 to 7782. The `conduit_data` volume is reused as-is. Subscriptions were removed: on first start, subscription nodes and settings are deleted; add the nodes you want to keep on the Proxy page.
 
 ---
 
@@ -130,12 +127,18 @@ docker compose up -d
 
 ## 🔌 Ports
 
-| Port | Service  | Purpose        |
-|------|----------|----------------|
-| **80**   | frontend | Web UI (nginx) |
-| **8000** | backend  | API            |
-| **8080** | backend  | HTTP proxy     |
-| **1080** | backend  | SOCKS5         |
+All ports are set in `.env` (see `.env.example`); the compose files and the UI read them from there. Set a proxy port to `0` to turn it off.
+
+| Default | Env var | Purpose |
+|---------|---------|---------|
+| **7782** | `CONDUIT_WEB_PORT` | Web UI + `/api` (nginx) |
+| **8080** | `CONDUIT_HYBRID_HTTP_PORT` | HTTP proxy, hybrid (Domains rules) |
+| **1080** | `CONDUIT_HYBRID_SOCKS_PORT` | SOCKS5, hybrid (Domains rules) |
+| **8081** | `CONDUIT_FULL_HTTP_PORT` | HTTP proxy, full tunnel |
+| **1081** | `CONDUIT_FULL_SOCKS_PORT` | SOCKS5, full tunnel |
+| 8000 | `CONDUIT_API_PORT` | API (internal only, behind nginx) |
+
+The full-tunnel ports open only once a node is selected, so their traffic can never fall back to direct.
 
 ---
 
@@ -144,21 +147,21 @@ docker compose up -d
 - **Proxy display host** (Settings) — Host or IP shown in the Dashboard “How to use the proxy” panel (e.g. your server IP or hostname instead of `127.0.0.1`).
 - **Proxy authentication** (Settings) — Optional username/password for HTTP and SOCKS5; leave empty for no auth.
 
-Point your system or apps at `http://HOST:8080` (HTTP) or `socks5://HOST:1080` (SOCKS5). Only requests to domains you added in the UI go through the proxy.
+Point your system or apps at a hybrid port (`http://HOST:8080`, `socks5://HOST:1080`) to send only the domains you added through the proxy, or at a full-tunnel port (`http://HOST:8081`, `socks5://HOST:1081`) to send everything through it. The Proxy page lists all four endpoints with copyable URLs.
 
 ---
 
 ## 🧪 Test the proxy
 
 ```bash
-# HTTP proxy (port 8080)
-curl -x http://localhost:8080 https://example.com -I
+# Hybrid: shows your server's own IP unless ifconfig.me is in your Domains list
+curl -x http://localhost:8080 https://ifconfig.me
+curl -x socks5h://localhost:1080 https://ifconfig.me
 
-# SOCKS5 (port 1080)
-curl -x socks5://localhost:1080 https://example.com -I
+# Full tunnel: always shows the node's IP
+curl -x http://localhost:8081 https://ifconfig.me
+curl -x socks5h://localhost:1081 https://ifconfig.me
 ```
-
-With a valid node and proxy domains configured, these return HTTP headers from the target site.
 
 ---
 
@@ -168,7 +171,7 @@ Run backend and frontend separately:
 
 ```bash
 # Backend (terminal 1)
-cd backend && pip install -r requirements.txt && DATABASE_PATH=./data/conduit.db uvicorn main:app --reload --port 8000
+cd backend && pip install -r requirements.txt && DATABASE_PATH=./data/conduit.db uvicorn main:app --reload --port ${CONDUIT_API_PORT:-8000}
 
 # Frontend (terminal 2)
 cd frontend && npm install && npm run dev

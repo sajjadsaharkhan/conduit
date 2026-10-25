@@ -1,4 +1,4 @@
-"""FastAPI app: auth, settings, subscription, nodes, domains, core status. Serves frontend static."""
+"""FastAPI app: auth, settings, nodes, domains, core status. The frontend is served by nginx."""
 import asyncio
 import json
 import os
@@ -16,8 +16,8 @@ from pydantic import BaseModel
 
 from auth import hash_password, verify_password, create_access_token, decode_token
 from database import init_db, db_connection
-from subscription import fetch_subscription, parse_share_link
-from latency import check_nodes_latency, select_best_node
+from share_links import parse_share_link
+from latency import check_node_latency, check_nodes_latency
 from config_generator import (
     build_singbox_config,
     build_xray_config,
@@ -42,12 +42,19 @@ from core_manager import (
     start_temp_core,
     stop_temp_core,
 )
-from scheduler import refresh_and_apply, start_scheduler, run_refresh_once
 from latency_test import run_latency_test
 from url_utils import host_from_url
 from config_file_manager import ConfigFileManager
 from default_config import get_default_config, get_default_singbox_config, get_default_xray_config
 from migration import migrate_db_to_config
+from proxy_layout import (
+    FULL_HTTP_PORT,
+    HYBRID_HTTP_PORT,
+    PROXY_TAGS,
+    XRAY_API_PORT,
+    apply_proxy_layout,
+    proxy_ports,
+)
 
 
 # --- Auth dependency ---
@@ -80,10 +87,7 @@ class ChangePasswordRequest(BaseModel):
 
 
 class SettingUpdate(BaseModel):
-    subscription_url: str | None = None
     core_type: str | None = None  # "sing-box" | "xray"
-    refresh_interval_minutes: int | None = None  # 1–1440
-    auto_switch_best: bool | None = None
     latency_test_domain: str | None = None  # e.g. "https://example.com"
     proxy_display_host: str | None = None  # host/IP shown in Dashboard "How to use the proxy" (display only)
     proxy_username: str | None = None  # optional auth for HTTP/SOCKS proxy (empty = no auth)
@@ -101,14 +105,15 @@ class DomainBulkRequest(BaseModel):
     outbound: str = "proxy"  # outbound applied to all imported entries: "proxy" | "direct"
 
 
-class ManualConfigRequest(BaseModel):
+class AddNodeRequest(BaseModel):
     share_link: str | None = None  # single vmess:// or vless:// etc
     raw_json: str | None = None    # or full sing-box outbound (we merge with inbounds)
+    activate: bool = True          # also make it the active node
 
 
 class SelectNodeRequest(BaseModel):
     raw_link: str
-    node_id: int | None = None  # optional; when set, real_latency_ms is updated by id (reliable for subscription nodes)
+    node_id: int | None = None  # optional; preferred over raw_link to find the node
 
 
 class UpdateNodeRequest(BaseModel):
@@ -119,7 +124,7 @@ class LatencyTestRequest(BaseModel):
     url: str | None = None  # use settings latency_test_domain if omitted
 
 
-# --- Lifespan: init DB, ensure admin, start scheduler ---
+# --- Lifespan: init DB, ensure admin, sync config ports ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
@@ -137,19 +142,21 @@ async def lifespan(app: FastAPI):
 
     # Run one-time migration from DB to config file
     await migrate_db_to_config()
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        core_type = await _get_setting(cursor, "core_type", "sing-box")
+        selected_raw = (await _get_setting(cursor, "selected_node_raw", "")).strip()
+    await _sync_config_layout(core_type)
+    # Start the core with the active node: since subscriptions were removed, nothing else starts it at boot
+    if selected_raw:
+        try:
+            await _apply_node_config(selected_raw)
+        except ValueError:
+            pass  # node no longer parses; the UI shows the core as stopped
 
-    start_scheduler()
-    # Run first refresh after a short delay
-    import asyncio
-    asyncio.create_task(_delayed_refresh())
     yield
     # shutdown: stop core?
     core_stop()
-
-
-async def _delayed_refresh():
-    await asyncio.sleep(5)
-    await run_refresh_once()
 
 
 app = FastAPI(title="Conduit API", lifespan=lifespan)
@@ -184,12 +191,8 @@ async def get_settings(username: str = Depends(get_current_user)):
         rows = await cursor.fetchall()
     settings = {r[0]: r[1] for r in rows}
     return {
-        "subscription_url": settings.get("subscription_url", ""),
         "core_type": settings.get("core_type", "sing-box"),
-        "last_refresh": settings.get("last_refresh", ""),
         "selected_node_raw": settings.get("selected_node_raw", ""),
-        "refresh_interval_minutes": int(settings.get("refresh_interval_minutes", "1")),
-        "auto_switch_best": settings.get("auto_switch_best", "true").lower() in ("true", "1", "yes"),
         "latency_test_domain": settings.get("latency_test_domain", "https://www.gstatic.com/generate_204"),
         "proxy_display_host": (settings.get("proxy_display_host") or "127.0.0.1").strip() or "127.0.0.1",
         "proxy_username": (settings.get("proxy_username") or "").strip() or "",
@@ -224,28 +227,12 @@ async def update_settings(
     """Update panel settings in database. Core config is managed via /api/config endpoints."""
     async with db_connection() as conn:
         cursor = await conn.cursor()
-        if body.subscription_url is not None:
-            await cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('subscription_url', ?)",
-                (body.subscription_url,),
-            )
         if body.core_type is not None:
             if body.core_type not in ("sing-box", "xray"):
                 raise HTTPException(status_code=400, detail="core_type must be 'sing-box' or 'xray'")
             await cursor.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('core_type', ?)",
                 (body.core_type,),
-            )
-        if body.refresh_interval_minutes is not None:
-            v = max(1, min(1440, body.refresh_interval_minutes))
-            await cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('refresh_interval_minutes', ?)",
-                (str(v),),
-            )
-        if body.auto_switch_best is not None:
-            await cursor.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_switch_best', ?)",
-                ("true" if body.auto_switch_best else "false",),
             )
         if body.latency_test_domain is not None:
             val = body.latency_test_domain.strip()
@@ -278,13 +265,6 @@ async def update_settings(
                     await _apply_node_config(selected_raw)
                 except ValueError:
                     pass  # e.g. invalid node; config unchanged
-    return {"ok": True}
-
-
-# --- Subscription: refresh now ---
-@app.post("/api/subscription/refresh")
-async def subscription_refresh(username: str = Depends(get_current_user)):
-    await refresh_and_apply()
     return {"ok": True}
 
 
@@ -379,26 +359,81 @@ async def select_node(
     body: SelectNodeRequest,
     username: str = Depends(get_current_user),
 ):
-    """Use a specific node (by raw_link) and regenerate config."""
-    parsed = parse_share_link(body.raw_link)
-    if not parsed:
-        raise HTTPException(status_code=400, detail="Invalid share link")
+    """Make a stored node the active one and regenerate config."""
     async with db_connection() as conn:
         cursor = await conn.cursor()
+        if body.node_id is not None:
+            await cursor.execute("SELECT raw_link FROM nodes WHERE id = ?", (body.node_id,))
+        else:
+            await cursor.execute("SELECT raw_link FROM nodes WHERE raw_link = ?", (body.raw_link,))
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Node not found")
+        raw_link = row[0]
         await cursor.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
-            (body.raw_link,),
+            (raw_link,),
         )
         await conn.commit()
-    # Update the config file with the new node
-    await _apply_node_config(body.raw_link)
+    try:
+        await _apply_node_config(raw_link)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {"ok": True}
+
+
+@app.post("/api/nodes/ping")
+async def ping_nodes(username: str = Depends(get_current_user)):
+    """TCP-connect latency from this server to every node, in parallel. Stores latency_ms."""
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        await cursor.execute("SELECT id, parsed_json FROM nodes")
+        rows = await cursor.fetchall()
+    nodes = []
+    for node_id, parsed_json in rows:
+        try:
+            node = json.loads(parsed_json) if parsed_json else {}
+        except json.JSONDecodeError:
+            node = {}
+        node["_id"] = node_id
+        nodes.append(node)
+    await check_nodes_latency(nodes)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        for node in nodes:
+            await cursor.execute(
+                "UPDATE nodes SET latency_ms = ?, last_check = ? WHERE id = ?",
+                (node.get("latency_ms"), now, node["_id"]),
+            )
+        await conn.commit()
+    return {"results": [{"id": n["_id"], "latency_ms": n.get("latency_ms")} for n in nodes]}
 
 
 async def _get_setting(cursor, key: str, default: str) -> str:
     await cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
     row = await cursor.fetchone()
     return row[0] if row else default
+
+
+async def _write_core_config(manager: ConfigFileManager, config: Dict[str, Any], core_type: str) -> None:
+    """Write the core config with env ports, proxy auth and the full-tunnel rule enforced."""
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
+        proxy_password = await _get_setting(cursor, "proxy_password", "")
+    apply_proxy_layout(config, core_type, proxy_username, proxy_password)
+    manager.write_config(config)
+
+
+async def _sync_config_layout(core_type: str) -> None:
+    """Bring an existing config file in line with the env ports (e.g. after a port env var changed)."""
+    manager = get_config_manager(core_type)
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        return
+    await _write_core_config(manager, config, core_type)
 
 
 async def _apply_node_config(raw_link: str) -> None:
@@ -418,10 +453,7 @@ async def _apply_node_config(raw_link: str) -> None:
             if not parsed:
                 raise ValueError("Invalid or unknown node")
 
-        # Get settings
         core_type = await _get_setting(cursor, "core_type", "sing-box")
-        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-        proxy_password = await _get_setting(cursor, "proxy_password", "")
 
     manager = get_config_manager(core_type)
 
@@ -431,13 +463,10 @@ async def _apply_node_config(raw_link: str) -> None:
     except FileNotFoundError:
         config = get_default_xray_config() if core_type == "xray" else get_default_singbox_config()
 
-    # Always reset inbounds to the correct default structure
-    # This ensures ports and listen addresses are always correct
+    # Inbounds, proxy auth and the full-tunnel rule are rebuilt from env in _write_core_config
     if core_type == "sing-box":
-        default_config = get_default_singbox_config()
-        config["inbounds"] = default_config["inbounds"]
-        # Also set correct log level to suppress benign warnings
-        config["log"] = default_config["log"]
+        # Set correct log level to suppress benign warnings
+        config["log"] = get_default_singbox_config()["log"]
 
         # Update proxy outbound with the new node
         proxy_outbound = parsed_to_singbox_outbound(parsed)
@@ -449,25 +478,8 @@ async def _apply_node_config(raw_link: str) -> None:
             outbounds.append(proxy_outbound)
         config["outbounds"] = outbounds
 
-        # Update inbounds with proxy auth if credentials provided
-        if proxy_username and proxy_password:
-            for inbound in config.get("inbounds", []):
-                if inbound.get("type") in ("http", "socks"):
-                    inbound["users"] = [{
-                        "username": proxy_username,
-                        "password": proxy_password
-                    }]
-        else:
-            # Remove users if no auth
-            for inbound in config.get("inbounds", []):
-                if "users" in inbound:
-                    del inbound["users"]
-
         config_path = get_config_path()
     else:  # xray
-        default_config = get_default_xray_config()
-        config["inbounds"] = default_config["inbounds"]
-
         # Update proxy outbound with the new node
         proxy_outbound = parsed_to_xray_outbound(parsed)
         outbounds = config.get("outbounds", [])
@@ -478,25 +490,9 @@ async def _apply_node_config(raw_link: str) -> None:
             outbounds.append(proxy_outbound)
         config["outbounds"] = outbounds
 
-        # Update inbounds with proxy auth if credentials provided
-        if proxy_username and proxy_password:
-            for inbound in config.get("inbounds", []):
-                if inbound.get("protocol") in ("http", "socks"):
-                    inbound.setdefault("settings", {}).setdefault("users", [])
-                    inbound["settings"]["users"] = [{
-                        "user": proxy_username,
-                        "pass": proxy_password
-                    }]
-        else:
-            # Remove users if no auth
-            for inbound in config.get("inbounds", []):
-                if "settings" in inbound and "users" in inbound.get("settings", {}):
-                    del inbound["settings"]["users"]
-
         config_path = get_xray_config_path()
 
-    # Write updated config
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
     core_start(config_path, core_type)
 
 
@@ -784,7 +780,7 @@ async def add_domain(
         config[rules_key]["rules"] = []
 
     config[rules_key]["rules"].append(new_rule)
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
 
     await _reapply_config_if_node_selected()
 
@@ -813,7 +809,7 @@ async def delete_domain(
     rules = config.get(rules_key, {}).get("rules", [])
     if 0 <= domain_id < len(rules):
         rules.pop(domain_id)
-        manager.write_config(config)
+        await _write_core_config(manager, config, core_type)
         await _reapply_config_if_node_selected()
         return {"ok": True}
     else:
@@ -878,18 +874,19 @@ async def bulk_add_domains(
         new_rule = _domain_to_routing_rule(type_, value, body.outbound, core_type)
         config[rules_key]["rules"].append(new_rule)
 
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
     await _reapply_config_if_node_selected()
 
     return {"added": len(pairs), "message": f"Added {len(pairs)} domain rule(s)."}
 
 
-# --- Manual config (share link) ---
-@app.post("/api/manual/apply")
-async def apply_manual_config(
-    body: ManualConfigRequest,
+# --- Add node (share link or raw outbound JSON) ---
+@app.post("/api/nodes")
+async def add_node(
+    body: AddNodeRequest,
     username: str = Depends(get_current_user),
 ):
+    """Add a node to the list (adding the same link again updates it). With activate=true it also becomes active."""
     if body.share_link:
         parsed = parse_share_link(body.share_link.strip())
         if not parsed:
@@ -912,21 +909,32 @@ async def apply_manual_config(
     if not raw_link:
         raw_link = (body.share_link or "")[:200].strip() or ((body.raw_json or "")[:200].strip() if body.raw_json else "")
         parsed["raw"] = raw_link
+    name = parsed.get("remark") or parsed.get("ps") or parsed.get("name") or parsed.get("tag") or raw_link[:50]
+    latency_ms = await check_node_latency(parsed)
     async with db_connection() as conn:
         cursor = await conn.cursor()
-        await cursor.execute("DELETE FROM nodes WHERE source = 'manual'")
         await cursor.execute(
-            "INSERT INTO nodes (source, raw_link, parsed_json, name, created_at) VALUES ('manual', ?, ?, ?, datetime('now'))",
-            (raw_link, json.dumps(parsed, ensure_ascii=False), parsed.get("remark") or parsed.get("ps") or "manual"),
+            """INSERT INTO nodes (source, raw_link, parsed_json, name, latency_ms, last_check, created_at)
+               VALUES ('manual', ?, ?, ?, ?, datetime('now'), datetime('now'))
+               ON CONFLICT(raw_link) DO UPDATE SET
+                 parsed_json = excluded.parsed_json, name = excluded.name,
+                 latency_ms = excluded.latency_ms, last_check = excluded.last_check""",
+            (raw_link, json.dumps(parsed, ensure_ascii=False), name, latency_ms),
         )
-        await cursor.execute(
-            "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
-            (raw_link,),
-        )
+        await cursor.execute("SELECT id FROM nodes WHERE raw_link = ?", (raw_link,))
+        node_id = (await cursor.fetchone())[0]
+        if body.activate:
+            await cursor.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('selected_node_raw', ?)",
+                (raw_link,),
+            )
         await conn.commit()
-    # Update the config file with the new manual node
-    await _apply_node_config(raw_link)
-    return {"ok": True}
+    if body.activate:
+        try:
+            await _apply_node_config(raw_link)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True, "id": node_id, "latency_ms": latency_ms}
 
 
 def _usage_for_pid(pid: int | None) -> dict:
@@ -946,14 +954,11 @@ def _usage_for_pid(pid: int | None) -> dict:
     return out
 
 
-XRAY_STATS_API_PORT = 10085
-
-
 def _xray_traffic_bytes() -> tuple[int | None, int | None]:
-    """Query Xray stats API; return (upload_bytes, download_bytes) for inbounds http-in + socks-in, or (None, None)."""
+    """Query Xray stats API; return (upload_bytes, download_bytes) for the proxy inbounds, or (None, None)."""
     try:
         r = subprocess.run(
-            [XRAY_BIN, "api", "statsquery", "--server=127.0.0.1:%s" % XRAY_STATS_API_PORT],
+            [XRAY_BIN, "api", "statsquery", "--server=127.0.0.1:%s" % XRAY_API_PORT],
             capture_output=True,
             timeout=5,
             text=True,
@@ -972,7 +977,7 @@ def _xray_traffic_bytes() -> tuple[int | None, int | None]:
                 continue
             if not name.endswith(">>>traffic>>>uplink") and not name.endswith(">>>traffic>>>downlink"):
                 continue
-            if "inbound>>>http-in>>>" in name or "inbound>>>socks-in>>>" in name:
+            if any(f"inbound>>>{tag}>>>" in name for tag in PROXY_TAGS):
                 if name.endswith(">>>traffic>>>uplink"):
                     upload += value
                 else:
@@ -1014,40 +1019,6 @@ def _singbox_traffic_bytes() -> tuple[int | None, int | None]:
 
 
 # --- Core status and control ---
-def _get_ports_from_config(core_type: str) -> tuple[int, int]:
-    """Get http and socks ports from config file. Returns (http_port, socks_port)."""
-    try:
-        manager = get_config_manager(core_type)
-        config = manager.read_config()
-        inbounds = config.get("inbounds", [])
-        http_port = 8080
-        socks_port = 1080
-
-        for inbound in inbounds:
-            if core_type == "sing-box":
-                inbound_type = inbound.get("type", "")
-                port = inbound.get("listen_port", 8080)
-                if inbound_type == "http":
-                    http_port = port
-                elif inbound_type == "socks":
-                    socks_port = port
-                elif inbound_type == "mixed":
-                    # Mixed type handles both HTTP and SOCKS on same port
-                    http_port = port
-                    socks_port = port
-            else:  # xray
-                protocol = inbound.get("protocol", "")
-                port = inbound.get("port", 8080)
-                if protocol == "http":
-                    http_port = port
-                elif protocol == "socks":
-                    socks_port = port
-        return (http_port, socks_port)
-    except FileNotFoundError:
-        # Config file doesn't exist, return defaults
-        return (8080, 1080)
-
-
 @app.get("/api/status")
 async def status(username: str = Depends(get_current_user)):
     st = core_status()
@@ -1086,19 +1057,14 @@ async def status(username: str = Depends(get_current_user)):
             if down is not None:
                 usage["download_bytes"] = down
 
-    # Get ports from config file
-    http_port, socks_port = _get_ports_from_config(settings.get("core_type", "sing-box"))
-
     return {
         "core": st,
         "core_type": settings.get("core_type", "sing-box"),
-        "http_port": http_port,
-        "socks_port": socks_port,
+        **proxy_ports(),
         "proxy_display_host": settings.get("proxy_display_host", "127.0.0.1"),
         "proxy_username": (settings.get("proxy_username") or "").strip() or "",
         "proxy_password": settings.get("proxy_password") or "",
         "latency_test_domain": (settings.get("latency_test_domain") or "https://example.com").strip() or "https://example.com",
-        "last_refresh": settings.get("last_refresh", ""),
         "selected_node_raw": selected_raw[:80] + "..." if len(selected_raw) > 80 else selected_raw,
         "selected_node_name": selected_name,
         "selected_node_latency_ms": selected_latency_ms,
@@ -1109,16 +1075,22 @@ async def status(username: str = Depends(get_current_user)):
 
 @app.post("/api/core/start")
 async def core_start_api(username: str = Depends(get_current_user)):
-    """Start the core with the config file. If config file is missing, runs a refresh first."""
+    """Start the core with the config file. If the file is missing, it is built from the active node."""
     from pathlib import Path
     settings_res = await get_settings(username)
     core_type = settings_res.get("core_type", "sing-box")
     path = get_xray_config_path() if core_type == "xray" else get_config_path()
 
-    # If config file doesn't exist, try to refresh to create it
     if not Path(path).exists():
-        await refresh_and_apply()
+        selected_raw = (settings_res.get("selected_node_raw") or "").strip()
+        if not selected_raw:
+            raise HTTPException(status_code=400, detail="No active node. Add a node on the Proxy page and use it.")
+        try:
+            await _apply_node_config(selected_raw)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
         return {"ok": True, "running": core_status()["running"]}
+    await _sync_config_layout(core_type)
     ok = core_start(path, core_type)
     return {"ok": ok, "running": core_status()["running"]}
 
@@ -1135,6 +1107,7 @@ async def core_restart_api(username: str = Depends(get_current_user)):
     settings_res = await get_settings(username)
     core_type = settings_res.get("core_type", "sing-box")
     path = get_xray_config_path() if core_type == "xray" else get_config_path()
+    await _sync_config_layout(core_type)
     core_restart(path, core_type)
     return {"ok": True, "running": core_status()["running"]}
 
@@ -1160,7 +1133,10 @@ async def core_latency_test(
     if not url:
         raise HTTPException(status_code=400, detail="No test URL. Set a URL in Core → Latency test and save.")
     core_type = settings_res.get("core_type", "sing-box")
-    http_port, _ = _get_ports_from_config(core_type)
+    # Prefer the full-tunnel port so the test always measures the node, whatever the Domains rules say
+    http_port = FULL_HTTP_PORT or HYBRID_HTTP_PORT
+    if http_port is None:
+        raise HTTPException(status_code=400, detail="No HTTP proxy port is enabled")
     proxy_username = (settings_res.get("proxy_username") or "").strip()
     proxy_password = settings_res.get("proxy_password") or ""
     result = await asyncio.to_thread(run_latency_test, url, http_port, proxy_username, proxy_password)
@@ -1284,11 +1260,13 @@ async def update_config_section(
         if section_name == "all":
             if not isinstance(section_data, dict):
                 raise HTTPException(status_code=400, detail="Config data must be a dict when updating 'all'")
-            manager.write_config(section_data)
+            await _write_core_config(manager, section_data, core_type)
             return {"ok": True, "message": "Full config updated successfully"}
 
-        # Update section in config file
-        manager.update_section(section_name, section_data)
+        # Update section in config file (inbounds always follow the env ports)
+        config = manager.read_config()
+        config[section_name] = section_data
+        await _write_core_config(manager, config, core_type)
 
         return {"ok": True, "message": f"Section '{section_name}' updated successfully"}
     except FileNotFoundError:

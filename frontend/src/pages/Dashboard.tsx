@@ -12,6 +12,7 @@ import {
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { cn } from '@/lib/utils'
+import { MODE_INFO, portFor, proxyUrl, type ProxyMode } from '@/lib/proxy-endpoints'
 import { Info, ArrowUp, ArrowDown, Network } from 'lucide-react'
 
 const LOG_POLL_INTERVAL_MS = 1000
@@ -45,19 +46,22 @@ export default function Dashboard() {
   const [realLatencyTesting, setRealLatencyTesting] = useState(false)
   const logContainerRef = useRef<HTMLDivElement>(null)
   const realLatencyTestStartedForRef = useRef<string | null>(null)
-  const httpPort = data?.http_port ?? 8080
-  const socksPort = data?.socks_port ?? 1080
+  const [proxyMode, setProxyMode] = useState<ProxyMode>('hybrid')
+  const ports = {
+    hybrid_http_port: data?.hybrid_http_port ?? null,
+    full_http_port: data?.full_http_port ?? null,
+    hybrid_socks_port: data?.hybrid_socks_port ?? null,
+    full_socks_port: data?.full_socks_port ?? null,
+  }
+  const httpPort = portFor(ports, proxyMode, 'http')
+  const socksPort = portFor(ports, proxyMode, 'socks5')
   const proxyHost = data?.proxy_display_host ?? '127.0.0.1'
   const proxyUser = (data?.proxy_username ?? '').trim()
   const proxyPass = data?.proxy_password ?? ''
   const hasProxyAuth = Boolean(proxyUser && proxyPass)
   const curlTestUrl = (data?.latency_test_domain || 'https://example.com').trim() || 'https://example.com'
-  const httpProxyUrl = hasProxyAuth
-    ? `http://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${proxyHost}:${httpPort}`
-    : `http://${proxyHost}:${httpPort}`
-  const socksProxyUrl = hasProxyAuth
-    ? `socks5://${encodeURIComponent(proxyUser)}:${encodeURIComponent(proxyPass)}@${proxyHost}:${socksPort}`
-    : `socks5://${proxyHost}:${socksPort}`
+  const httpProxyUrl = httpPort == null ? '' : proxyUrl('http', proxyHost, httpPort, proxyUser, proxyPass)
+  const socksProxyUrl = socksPort == null ? '' : proxyUrl('socks5', proxyHost, socksPort, proxyUser, proxyPass)
 
   function loadStatus() {
     statusApi.get().then(setData).catch((e) => setErr(e.message)).finally(() => setLoading(false))
@@ -221,7 +225,7 @@ export default function Dashboard() {
             <div className="flex items-center gap-1.5">
               <CardTitle className="text-base">Current node</CardTitle>
               <Tooltip
-                content="The proxy node currently in use. Latency is from subscription check or last test. Last refresh is when the node list was updated."
+                content="The proxy node currently in use. Latency is from the last Test (real) or Ping (TCP) on the Proxy page."
                 side="top"
               >
                 <span className="text-muted-foreground cursor-help inline-flex">
@@ -247,12 +251,6 @@ export default function Dashboard() {
                     : data.selected_node_latency_ms != null
                       ? `${data.selected_node_latency_ms} ms (TCP)`
                       : '—'}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Last refresh</span>
-              <span className="text-muted-foreground truncate pl-2 text-right">
-                {data.last_refresh || '—'}
               </span>
             </div>
           </CardContent>
@@ -312,19 +310,38 @@ export default function Dashboard() {
               </span>
             </Tooltip>
           </div>
-          <div className="mt-2 flex flex-wrap items-center gap-3 rounded-lg border border-border bg-muted/20 px-4 py-3">
-            <span className="text-sm font-medium text-muted-foreground">Ports</span>
-            <span className="inline-flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 font-mono text-sm ring-1 ring-border">
-              HTTP <span className="font-semibold text-foreground">{httpPort}</span>
-            </span>
-            <span className="inline-flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 font-mono text-sm ring-1 ring-border">
-              SOCKS5 <span className="font-semibold text-foreground">{socksPort}</span>
-            </span>
-            <Tooltip content="Change these in Settings; restart the core to apply." side="top">
-              <span className="cursor-help text-muted-foreground">
-                <Info className="h-3.5 w-3.5" />
+          <div className="mt-2 space-y-3 rounded-lg border border-border bg-muted/20 px-4 py-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className="text-sm font-medium text-muted-foreground">Mode</span>
+              <div role="group" aria-label="Proxy mode" className="inline-flex rounded-md bg-background p-0.5 ring-1 ring-border">
+                {(['hybrid', 'full'] as const).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    aria-pressed={proxyMode === m}
+                    onClick={() => setProxyMode(m)}
+                    className={cn(
+                      'min-h-9 rounded px-3 text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                      proxyMode === m ? 'bg-primary text-primary-foreground' : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    {MODE_INFO[m].label}
+                  </button>
+                ))}
+              </div>
+              <span className="inline-flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 font-mono text-sm ring-1 ring-border">
+                HTTP <span className="font-semibold text-foreground">{httpPort ?? 'off'}</span>
               </span>
-            </Tooltip>
+              <span className="inline-flex items-center gap-1.5 rounded-md bg-background px-2.5 py-1 font-mono text-sm ring-1 ring-border">
+                SOCKS5 <span className="font-semibold text-foreground">{socksPort ?? 'off'}</span>
+              </span>
+              <Tooltip content="Ports are set with the CONDUIT_* environment variables; restart the container to change them." side="top">
+                <span className="cursor-help text-muted-foreground">
+                  <Info className="h-3.5 w-3.5" />
+                </span>
+              </Tooltip>
+            </div>
+            <p className="text-sm text-muted-foreground">{MODE_INFO[proxyMode].summary}</p>
           </div>
         </CardHeader>
         <CardContent>
