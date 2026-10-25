@@ -1,14 +1,15 @@
 # Conduit - deploy with the pre-built image (no build on your machine).
-# Image: ghcr.io/sajjadsaharkhan/conduit:main
+# Image and tag come from .env (CONDUIT_IMAGE, CONDUIT_TAG). On production use deploy/deploy.sh
+# (see docs/runbook.md); it pins the tag, backs up /data, health-checks and rolls back.
 #
-# Usage:
-#   cp .env.example .env   # optional: change ports / admin login
+# Manual usage:
+#   cp .env.example .env
 #   docker compose -f docker-compose.deploy.yml up -d
 
 services:
   conduit:
-    image: ghcr.io/sajjadsaharkhan/conduit:main
-    container_name: conduit
+    image: ${CONDUIT_IMAGE:-ghcr.io/sajjadsaharkhan/conduit}:${CONDUIT_TAG:-latest}
+    container_name: ${CONDUIT_CONTAINER:-conduit}
     ports:
       - "${CONDUIT_WEB_PORT:-7782}:${CONDUIT_WEB_PORT:-7782}"                    # Web UI + API
       - "${CONDUIT_HYBRID_HTTP_PORT:-8080}:${CONDUIT_HYBRID_HTTP_PORT:-8080}"    # HTTP proxy (hybrid)
@@ -28,6 +29,14 @@ services:
       - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       - DATABASE_PATH=/data/conduit.db
       - SINGBOX_CONFIG_PATH=/data/singbox_config.json
+    # Heavy load: each proxied connection holds two sockets, and bursts of new connections need a deep accept queue
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    sysctls:
+      net.core.somaxconn: 65535
+      net.ipv4.tcp_max_syn_backlog: 65535
+      net.ipv4.ip_local_port_range: "10000 65000"
+      net.ipv4.tcp_fastopen: 3
     restart: unless-stopped
 
 volumes:

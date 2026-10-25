@@ -1,18 +1,57 @@
-# Build and push the Conduit image (UI + API + cores) to GitHub Container Registry.
+# Build the Conduit image (UI + API + cores), smoke test it, then push it to GitHub Container Registry.
+#
+# Tags pushed (deploy/deploy.sh pins one of these on the server):
+#   main            every push to main (moves)
+#   <7-char sha>    every push to main (fixed: one image per commit)
+#   v1.2.3, 1.2     on a git tag v1.2.3 (fixed), plus "latest" = newest release
+# Pull requests build and smoke test without pushing.
 name: Docker build
 
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
+    paths-ignore: ['docs/**', 'bench/**', '**/*.md']
   pull_request:
     branches: [main, master]
+    paths-ignore: ['docs/**', 'bench/**', '**/*.md']
   workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build (amd64, loaded locally)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          tags: conduit:smoke
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        run: .github/scripts/smoke-test.sh conduit:smoke
+
   build:
+    needs: smoke-test
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -36,12 +75,15 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=auto
           tags: |
             type=ref,event=branch
             type=ref,event=pr
             type=semver,pattern={{version}}
-            type=sha,prefix=
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,format=short
 
       - name: Build and push
         uses: docker/build-push-action@v6
