@@ -50,11 +50,3 @@ async def check_nodes_latency(nodes: List[Dict[str, Any]], timeout: float = TEST
 
     await asyncio.gather(*[one(n) for n in nodes])
     return nodes
-
-
-def select_best_node(nodes: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Return node with lowest latency_ms (excluding None)."""
-    with_latency = [n for n in nodes if n.get("latency_ms") is not None]
-    if not with_latency:
-        return nodes[0] if nodes else None
-    return min(with_latency, key=lambda n: n["latency_ms"])

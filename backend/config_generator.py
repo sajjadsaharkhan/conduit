@@ -109,7 +109,7 @@ def _build_transport(node: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parsed_to_singbox_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dict[str, Any]:
-    """Convert parsed node (from subscription or manual) to sing-box outbound."""
+    """Convert a parsed node to a sing-box outbound."""
     _apply_params_to_node(node)
     t = node.get("type")
     server = node.get("server") or node.get("add")

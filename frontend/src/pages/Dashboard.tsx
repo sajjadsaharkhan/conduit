@@ -225,7 +225,7 @@ export default function Dashboard() {
             <div className="flex items-center gap-1.5">
               <CardTitle className="text-base">Current node</CardTitle>
               <Tooltip
-                content="The proxy node currently in use. Latency is from subscription check or last test. Last refresh is when the node list was updated."
+                content="The proxy node currently in use. Latency is from the last Test (real) or Ping (TCP) on the Proxy page."
                 side="top"
               >
                 <span className="text-muted-foreground cursor-help inline-flex">
@@ -251,12 +251,6 @@ export default function Dashboard() {
                     : data.selected_node_latency_ms != null
                       ? `${data.selected_node_latency_ms} ms (TCP)`
                       : '—'}
-              </span>
-            </div>
-            <div className="flex justify-between">
-              <span className="text-muted-foreground">Last refresh</span>
-              <span className="text-muted-foreground truncate pl-2 text-right">
-                {data.last_refresh || '—'}
               </span>
             </div>
           </CardContent>

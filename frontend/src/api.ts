@@ -70,12 +70,8 @@ export const auth = {
 export const settings = {
   get: () =>
     api<{
-      subscription_url: string
       core_type: string
-      last_refresh: string
       selected_node_raw: string
-      refresh_interval_minutes: number
-      auto_switch_best: boolean
       latency_test_domain: string
       proxy_display_host: string
       proxy_username: string
@@ -86,10 +82,7 @@ export const settings = {
       dns_final: string
     }>('/api/settings'),
   update: (body: {
-    subscription_url?: string
     core_type?: string
-    refresh_interval_minutes?: number
-    auto_switch_best?: boolean
     latency_test_domain?: string
     proxy_display_host?: string
     proxy_username?: string
@@ -99,10 +92,6 @@ export const settings = {
     dns_servers?: string
     dns_final?: string
   }) => api<{ ok: boolean }>('/api/settings', { method: 'PUT', body: JSON.stringify(body) }),
-}
-
-export const subscription = {
-  refresh: () => api<{ ok: boolean }>('/api/subscription/refresh', { method: 'POST' }),
 }
 
 export const nodes = {
@@ -118,11 +107,18 @@ export const nodes = {
         last_check: string | null
       }[]
     }>('/api/nodes'),
-  select: (raw_link: string) =>
+  add: (body: { share_link?: string; raw_json?: string; activate: boolean }) =>
+    api<{ ok: boolean; id: number; latency_ms: number | null }>('/api/nodes', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  select: (raw_link: string, node_id?: number) =>
     api<{ ok: boolean }>('/api/nodes/select', {
       method: 'POST',
-      body: JSON.stringify({ raw_link }),
+      body: JSON.stringify({ raw_link, node_id }),
     }),
+  ping: () =>
+    api<{ results: { id: number; latency_ms: number | null }[] }>('/api/nodes/ping', { method: 'POST' }),
   update: (id: number, raw_link: string) =>
     api<{ ok: boolean }>(`/api/nodes/${id}`, {
       method: 'PUT',
@@ -166,14 +162,6 @@ export const domains = {
     }),
 }
 
-export const manual = {
-  apply: (share_link?: string, raw_json?: string) =>
-    api<{ ok: boolean }>('/api/manual/apply', {
-      method: 'POST',
-      body: JSON.stringify({ share_link, raw_json }),
-    }),
-}
-
 export const status = {
   get: () =>
     api<{
@@ -188,7 +176,6 @@ export const status = {
       proxy_username: string
       proxy_password: string
       latency_test_domain: string
-      last_refresh: string
       selected_node_raw: string
       selected_node_name: string
       selected_node_latency_ms: number | null
