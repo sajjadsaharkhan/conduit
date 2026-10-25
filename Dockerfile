@@ -2,7 +2,8 @@
 # nginx serves the UI and /api on CONDUIT_WEB_PORT; the proxy ports are opened by the core itself.
 
 # --- Frontend build ---
-FROM node:20-alpine AS frontend
+# Static assets are the same for every CPU: build them once on the native platform (no emulation)
+FROM --platform=$BUILDPLATFORM node:20-alpine AS frontend
 WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json* ./
 RUN npm install
@@ -15,7 +16,7 @@ WORKDIR /app
 
 # Install sing-box: pick binary for build architecture (amd64 or arm64)
 ARG TARGETARCH
-ARG SINGBOX_VER=1.10.0
+ARG SINGBOX_VER=1.12.23
 # Override with e.g. --build-arg XRAY_VER=26.2.6 if the default is outdated
 ARG XRAY_VER=26.2.6
 # Ensure no HTTP proxy is used during build or at runtime (avoids routing issues)

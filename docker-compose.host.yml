@@ -1,0 +1,30 @@
+# Conduit with host networking: no Docker NAT or connection tracking on the proxy path.
+# Lowest latency under heavy load on Linux. Ports are opened directly on the host, so the
+# CONDUIT_* ports in .env must be free there. Host sysctls apply (see docs/performance.md).
+#
+# Usage:
+#   docker compose -f docker-compose.host.yml up -d
+services:
+  conduit:
+    image: ${CONDUIT_IMAGE:-ghcr.io/sajjadsaharkhan/conduit}:${CONDUIT_TAG:-latest}
+    container_name: ${CONDUIT_CONTAINER:-conduit}
+    network_mode: host
+    volumes:
+      - conduit_data:/data
+    environment:
+      - CONDUIT_WEB_PORT=${CONDUIT_WEB_PORT:-7782}
+      - CONDUIT_API_PORT=${CONDUIT_API_PORT:-8000}
+      - CONDUIT_HYBRID_HTTP_PORT=${CONDUIT_HYBRID_HTTP_PORT:-8080}
+      - CONDUIT_FULL_HTTP_PORT=${CONDUIT_FULL_HTTP_PORT:-8081}
+      - CONDUIT_HYBRID_SOCKS_PORT=${CONDUIT_HYBRID_SOCKS_PORT:-1080}
+      - CONDUIT_FULL_SOCKS_PORT=${CONDUIT_FULL_SOCKS_PORT:-1081}
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - DATABASE_PATH=/data/conduit.db
+      - SINGBOX_CONFIG_PATH=/data/singbox_config.json
+    ulimits:
+      nofile: {soft: 1048576, hard: 1048576}
+    restart: unless-stopped
+
+volumes:
+  conduit_data: {}

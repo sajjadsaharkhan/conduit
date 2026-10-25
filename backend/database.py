@@ -104,6 +104,14 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE proxy_domains ADD COLUMN outbound TEXT NOT NULL DEFAULT 'proxy'")
             await db.commit()
 
+        # Migration: per-node multiplex (connection pooling to the node): off | h2mux | smux | yamux
+        cursor = await db.execute("PRAGMA table_info(nodes)")
+        rows = await cursor.fetchall()
+        await cursor.close()
+        if not any(r[1] == "multiplex" for r in rows):
+            await db.execute("ALTER TABLE nodes ADD COLUMN multiplex TEXT NOT NULL DEFAULT 'off'")
+            await db.commit()
+
         # Subscriptions were removed: drop their nodes and settings. Idempotent, so it simply runs on every start.
         # The source column and its CHECK stay (SQLite can't alter a CHECK in place); new nodes are always 'manual'.
         await db.execute("DELETE FROM nodes WHERE source = 'subscription'")

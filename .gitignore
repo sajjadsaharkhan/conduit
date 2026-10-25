@@ -20,3 +20,6 @@ frontend/dist/
 *.log
 .env
 .env.local
+
+# Deploy state on the server (history, backups)
+.deploy/

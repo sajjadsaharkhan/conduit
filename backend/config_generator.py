@@ -1,686 +1,440 @@
-"""Generate sing-box JSON config from selected node and proxy_domains."""
-import json
-import os
-from typing import Dict, Any, List, Optional
+"""Build sing-box and Xray outbounds from nodes, and the node groups in a core config.
 
-from proxy_layout import apply_proxy_layout
+Nodes come in three shapes, all normalized to the model documented in share_links.py first:
+  - a parsed share link (vless://, vmess://, trojan://, ss://)
+  - a pasted sing-box outbound JSON ({"type": "vless", "server": ...})
+  - a pasted Xray outbound JSON ({"protocol": "vless", "settings": ...})
+Each core then gets its outbound from the model. A pasted JSON on its own core is used as-is, so fields
+Conduit doesn't model survive. Combinations a core can't run raise ValueError with the reason.
+"""
+from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode
 
-# When set (e.g. SINGBOX_CLASH_API=1), add experimental Clash API so Dashboard can show upload/download for sing-box
-SINGBOX_CLASH_API_ENV = "SINGBOX_CLASH_API"
-SINGBOX_CLASH_API_PORT = 9092
+from share_links import NETWORK_ALIASES, is_share_link, parse_share_link
 
-# Default DNS configuration
-DEFAULT_DNS_SERVERS = [
-    {"address": "223.5.5.5", "tag": "local_dns", "detour": "direct"},
-    {"address": "https://1.1.1.1/dns-query", "tag": "remote_dns", "detour": "proxy", "addressResolver": "local_dns"},
-    {"address": "https://8.8.8.8/dns-query", "tag": "remote_dns_alt", "detour": "direct", "addressResolver": "local_dns"}
-]
-
-DEFAULT_DNS_RULES = [
-    {"type": "field", "domain": ["domain:doh.pub", "domain:dot.pub", "domain:alidns.com", "domain:360.cn", "domain:onedns.net"], "server": "remote_dns_alt"}
-]
-
-DEFAULT_DNS_FINAL = "remote_dns"
+PROTOCOLS = ("vless", "vmess", "trojan", "shadowsocks")
+TLS_PROTOCOLS = ("vless", "vmess", "trojan")
 
 
-def _first_param(params: Dict[str, Any], key: str, default: str = "") -> str:
-    """Get first value from params (query string style: lists or single value)."""
-    v = params.get(key)
-    if v is None:
-        return default
-    if isinstance(v, list) and v:
-        return str(v[0]).strip() if v[0] is not None else default
-    return str(v).strip() if v is not None else default
+# --- node model ---------------------------------------------------------------------------------
+def node_kind(node: Dict[str, Any]) -> str:
+    """"link" (share link model), "sing-box" (sing-box outbound JSON) or "xray" (Xray outbound JSON)."""
+    if is_share_link(str(node.get("raw") or "")):  # any stored format; re-parsed from the link
+        return "link"
+    if "protocol" in node:
+        return "xray"
+    return "sing-box"
 
 
-def _apply_params_to_node(node: Dict[str, Any]) -> None:
-    """Copy transport/tls from node['params'] (v2ray query style) to top-level for _build_transport/_build_tls."""
-    params = node.get("params") or {}
-    if not params:
+def _model_from_singbox(ob: Dict[str, Any]) -> Dict[str, Any]:
+    tls = ob.get("tls") or {}
+    reality = tls.get("reality") or {}
+    tr = ob.get("transport") or {}
+    network = {"http": "h2"}.get(tr.get("type", "tcp"), tr.get("type", "tcp"))
+    host = tr.get("host")
+    if isinstance(host, list):
+        host = host[0] if host else ""
+    path = tr.get("path") or "/"
+    if network == "ws" and tr.get("max_early_data"):
+        path += ("&" if "?" in path else "?") + f"ed={tr['max_early_data']}"
+    return {
+        "type": ob.get("type"), "server": ob.get("server"), "server_port": int(ob.get("server_port") or 443),
+        "uuid": ob.get("uuid", ""), "password": ob.get("password", ""), "method": ob.get("method", ""),
+        "plugin": ob.get("plugin", ""), "plugin_opts": ob.get("plugin_opts", ""),
+        "alter_id": int(ob.get("alter_id") or 0), "vmess_security": ob.get("security", "auto"),
+        "flow": ob.get("flow", ""),
+        "network": network, "header_type": "none", "path": path,
+        "host": host or (tr.get("headers") or {}).get("Host", ""),
+        "service_name": tr.get("service_name", ""), "mode": "",
+        "security": "reality" if reality.get("enabled") else "tls" if tls.get("enabled") else "none",
+        "sni": tls.get("server_name", ""), "alpn": tls.get("alpn") or [],
+        "fingerprint": (tls.get("utls") or {}).get("fingerprint", ""), "insecure": bool(tls.get("insecure")),
+        "reality_public_key": reality.get("public_key", ""), "reality_short_id": reality.get("short_id", ""),
+        "reality_spider_x": "",
+    }
+
+
+def _model_from_xray(ob: Dict[str, Any]) -> Dict[str, Any]:
+    protocol = ob.get("protocol")
+    settings = ob.get("settings") or {}
+    if protocol in ("vless", "vmess"):
+        server = (settings.get("vnext") or [{}])[0]
+        user = (server.get("users") or [{}])[0]
+    else:
+        server = (settings.get("servers") or [{}])[0]
+        user = server
+    st = ob.get("streamSettings") or {}
+    network = NETWORK_ALIASES.get(st.get("network", "tcp"), st.get("network", "tcp"))
+    net_settings = st.get({"ws": "wsSettings", "grpc": "grpcSettings", "httpupgrade": "httpupgradeSettings",
+                           "xhttp": "xhttpSettings", "tcp": "tcpSettings"}.get(network, ""), {}) or {}
+    tls = st.get("tlsSettings") or {}
+    reality = st.get("realitySettings") or {}
+    security = st.get("security", "none")
+    tcp_header = (net_settings.get("header") or {}) if network == "tcp" else {}
+    host = net_settings.get("host") or (net_settings.get("headers") or {}).get("Host", "")
+    if tcp_header.get("type") == "http":
+        req = tcp_header.get("request") or {}
+        host = ((req.get("headers") or {}).get("Host") or [""])[0]
+        net_settings = {"path": (req.get("path") or ["/"])[0]}
+    return {
+        "type": protocol, "server": server.get("address"), "server_port": int(server.get("port") or 443),
+        "uuid": user.get("id", ""), "password": user.get("password", ""), "method": user.get("method", ""),
+        "plugin": "", "plugin_opts": "",
+        "alter_id": int(user.get("alterId") or 0), "vmess_security": user.get("security", "auto"),
+        "flow": user.get("flow", ""),
+        "network": network, "header_type": tcp_header.get("type", "none"),
+        "path": net_settings.get("path", "/"), "host": host,
+        "service_name": net_settings.get("serviceName", ""),
+        "mode": "multi" if net_settings.get("multiMode") else net_settings.get("mode", ""),
+        "security": security, "sni": tls.get("serverName") or reality.get("serverName", ""),
+        "alpn": tls.get("alpn") or [], "fingerprint": tls.get("fingerprint") or reality.get("fingerprint", ""),
+        "insecure": bool(tls.get("allowInsecure")),
+        "pinned_cert_sha256": tls.get("pinnedPeerCertSha256", ""),
+        "reality_public_key": reality.get("publicKey", ""), "reality_short_id": reality.get("shortId", ""),
+        "reality_spider_x": reality.get("spiderX", ""),
+    }
+
+
+def to_model(node: Dict[str, Any]) -> Dict[str, Any]:
+    """Any node shape -> the core-neutral model. Share links are re-parsed so stored nodes get parser fixes."""
+    kind = node_kind(node)
+    if kind == "xray":
+        model = _model_from_xray(node)
+    elif kind == "link":
+        model = parse_share_link(node["raw"]) or {}
+    else:
+        model = _model_from_singbox(node)
+    if model.get("type") not in PROTOCOLS or not model.get("server"):
+        raise ValueError(f"Unsupported or incomplete node: {str(node.get('raw') or node)[:80]}")
+    return model
+
+
+# --- sing-box -----------------------------------------------------------------------------------
+def _strip_ws_early_data(transport: Dict[str, Any]) -> None:
+    """Remove the v2ray/Xray "?ed=N" early-data hint from a sing-box WebSocket path.
+
+    sing-box would send "/ws?ed=2048" as an escaped path, which servers answer with 404. Early data itself
+    is not enabled: in testing (bench/lab), sing-box's Sec-WebSocket-Protocol early data lost about half
+    of the responses against both Xray and sing-box servers. Xray cores keep "?ed=" and use early data.
+    """
+    path, _, query = transport["path"].partition("?")
+    params = parse_qs(query, keep_blank_values=True)
+    if params.pop("ed", None) is None:
         return
-    # type / headerType -> net (v2ray: headerType=http = HTTP transport in sing-box, or ws in Xray/tcp disguise)
-    net = _first_param(params, "type") or _first_param(params, "network")
-    if _first_param(params, "headerType").lower() == "http":
-        net = "http"  # sing-box uses transport type "http" with host; Xray uses tcp+http disguise
-    if net:
-        node["net"] = net.lower()
-    path = _first_param(params, "path", "/")
-    if path:
-        node["path"] = path
-    host = _first_param(params, "host") or _first_param(params, "sni")
-    if host:
-        node["host"] = host
-    security = _first_param(params, "security")
-    if security:
-        node["security"] = security.lower()
-    sni = _first_param(params, "sni")
-    if sni:
-        node["sni"] = sni
-    header_type = _first_param(params, "headerType")
-    if header_type:
-        node["headerType"] = header_type
-    # TLS from security
-    if node.get("security") == "tls" or node.get("security") == "reality":
-        node["tls"] = "tls"
+    rest = urlencode(params, doseq=True)
+    transport["path"] = (path or "/") + (f"?{rest}" if rest else "")
 
 
-def _build_tls(node: Dict[str, Any], sni: str = None) -> Dict[str, Any]:
-    """Build TLS block if TLS is used."""
-    server = node.get("server") or node.get("add")
-    sni = sni or node.get("sni") or node.get("host") or server
-    if node.get("tls") in ("tls", "1", True) or node.get("security") == "tls":
-        return {"enabled": True, "server_name": sni}
-    return {"enabled": False}
-
-
-def _build_transport(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Build transport (ws, grpc, etc.) from node params."""
-    # Prefer net (set from params); for VLESS/VMess type is protocol name so don't use it for transport
-    net = (node.get("net") or "tcp").lower()
-    if net == "tcp" and node.get("type") and node.get("type") not in ("vless", "vmess", "trojan", "shadowsocks"):
-        net = (node.get("type") or "tcp").lower()
+def _singbox_transport(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    net = m.get("network") or "tcp"
+    if net == "tcp":
+        if m.get("header_type") == "http":
+            raise ValueError("TCP with HTTP header obfuscation only works on Xray; switch the core to Xray")
+        return None
     if net == "ws":
-        headers = dict(node.get("headers") or {})
-        if node.get("host") and "Host" not in headers:
-            headers["Host"] = node["host"]
-        return {
-            "type": "ws",
-            "path": node.get("path") or "/",
-            "headers": headers,
-        }
+        t = {"type": "ws", "path": m.get("path") or "/"}
+        if m.get("host"):
+            t["headers"] = {"Host": m["host"]}
+        _strip_ws_early_data(t)
+        return t
     if net == "grpc":
-        return {
-            "type": "grpc",
-            "service_name": node.get("serviceName") or node.get("path") or "grpc",
-        }
-    if net == "http":
-        return {
-            "type": "http",
-            "path": node.get("path") or "/",
-            "host": [node.get("host") or node.get("add") or ""] if node.get("host") else [],
-        }
+        return {"type": "grpc", "service_name": m.get("service_name") or ""}
     if net == "h2":
-        return {
-            "type": "http",
-            "path": node.get("path") or "/",
-            "host": [node.get("host") or node.get("add") or ""] if node.get("host") else [],
-        }
-    return {}
+        t = {"type": "http", "path": m.get("path") or "/"}
+        if m.get("host"):
+            t["host"] = [m["host"]]
+        return t
+    if net == "httpupgrade":
+        t = {"type": "httpupgrade", "path": m.get("path") or "/"}
+        if m.get("host"):
+            t["host"] = m["host"]
+        return t
+    raise ValueError(f"The {net} transport isn't supported by sing-box; switch the core to Xray")
 
 
-def parsed_to_singbox_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dict[str, Any]:
-    """Convert a parsed node to a sing-box outbound."""
-    _apply_params_to_node(node)
-    t = node.get("type")
-    server = node.get("server") or node.get("add")
-    port = int(node.get("server_port") or node.get("port") or 443)
+def _singbox_tls(m: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if m.get("security") not in ("tls", "reality"):
+        return None
+    tls: Dict[str, Any] = {"enabled": True, "server_name": m.get("sni") or m.get("host") or m["server"]}
+    if m.get("insecure"):
+        tls["insecure"] = True
+    if m.get("alpn"):
+        tls["alpn"] = m["alpn"]
+    fingerprint = m.get("fingerprint") or ("chrome" if m["security"] == "reality" else "")
+    if fingerprint:
+        tls["utls"] = {"enabled": True, "fingerprint": fingerprint}
+    if m["security"] == "reality":
+        if not m.get("reality_public_key"):
+            raise ValueError("Reality node without a public key (pbk)")
+        tls["reality"] = {"enabled": True, "public_key": m["reality_public_key"], "short_id": m.get("reality_short_id", "")}
+    return tls
 
-    if t == "vless":
-        out = {
-            "type": "vless",
-            "tag": tag,
-            "server": server,
-            "server_port": port,
-            "uuid": node.get("uuid", ""),
-            "network": "tcp",
-            "packet_encoding": "xudp",
-        }
-        flow = (node.get("params") or {}).get("flow")
-        if flow:
-            flow_val = flow[0] if isinstance(flow, list) and flow else flow
-            if flow_val:
-                out["flow"] = flow_val
-        tls = _build_tls(node)
-        if tls.get("enabled"):
-            out["tls"] = tls
-        transport = _build_transport(node)
-        if transport:
-            out["transport"] = transport
+
+def singbox_outbound(node: Dict[str, Any], tag: str) -> Dict[str, Any]:
+    """sing-box outbound for any node shape."""
+    if node_kind(node) == "sing-box":  # pasted sing-box JSON: keep every field
+        out = {k: v for k, v in node.items() if k not in ("raw", "remark", "name", "params", "port")}
+        out["tag"] = tag
+        out.setdefault("server_port", node.get("port"))
         return out
-
-    if t == "vmess":
-        out = {
-            "type": "vmess",
-            "tag": tag,
-            "server": server,
-            "server_port": port,
-            "uuid": node.get("id", ""),
-            "security": "auto",
-            "alter_id": int(node.get("aid") or 0),
-            "network": (node.get("net") or "tcp").lower(),
-        }
-        tls = _build_tls(node)
-        if tls.get("enabled"):
-            out["tls"] = tls
-        transport = _build_transport(node)
-        if transport:
-            out["transport"] = transport
+    m = to_model(node)
+    out: Dict[str, Any] = {"type": m["type"], "tag": tag, "server": m["server"], "server_port": m["server_port"]}
+    if m["type"] == "shadowsocks":
+        out.update({"method": m["method"], "password": m["password"]})
+        if m.get("plugin"):
+            out.update({"plugin": m["plugin"], "plugin_opts": m.get("plugin_opts", "")})
         return out
-
-    if t == "trojan":
-        out = {
-            "type": "trojan",
-            "tag": tag,
-            "server": server,
-            "server_port": port,
-            "password": node.get("password", ""),
-            "network": "tcp",
-        }
-        tls = _build_tls(node)
-        if tls.get("enabled"):
-            out["tls"] = tls
-        transport = _build_transport(node)
-        if transport:
-            out["transport"] = transport
-        return out
-
-    if t == "shadowsocks":
-        out = {
-            "type": "shadowsocks",
-            "tag": tag,
-            "server": server,
-            "server_port": port,
-            "method": node.get("method", "aes-256-gcm"),
-            "password": node.get("password", ""),
-        }
-        return out
-
-    return {}
-
-
-def _is_singbox_outbound(node: Dict[str, Any]) -> bool:
-    """True if node looks like a sing-box outbound (has type + server + port)."""
-    t = node.get("type")
-    if t not in ("vless", "vmess", "trojan", "shadowsocks"):
-        return False
-    server = node.get("server") or node.get("add")
-    port = node.get("server_port") or node.get("port")
-    return bool(server and port is not None)
-
-
-# Keys that are not part of sing-box outbound schema (v2ray/share-link/app fields)
-_SINGBOX_OUTBOUND_STRIP = frozenset({
-    "raw", "remark", "name", "params", "latency_ms", "last_check",
-    "add", "ps",  # v2ray/share-link; "id" is used by vmess, "port" copied to server_port
-})
-
-
-def _normalize_singbox_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dict[str, Any]:
-    """Use a sing-box outbound as-is, ensuring tag and server_port (sing-box uses server_port)."""
-    out = {k: v for k, v in node.items() if k not in _SINGBOX_OUTBOUND_STRIP}
-    out["tag"] = tag
-    if "server_port" not in out and node.get("port") is not None:
-        out["server_port"] = node["port"]
-    out.pop("port", None)  # sing-box only accepts server_port
+    if m["type"] == "vless":
+        out.update({"uuid": m["uuid"], "packet_encoding": "xudp"})
+        if m.get("flow"):
+            out["flow"] = m["flow"]
+    elif m["type"] == "vmess":
+        out.update({"uuid": m["uuid"], "alter_id": m.get("alter_id", 0), "security": m.get("vmess_security") or "auto"})
+    else:
+        out["password"] = m["password"]
+    tls = _singbox_tls(m)
+    if tls:
+        out["tls"] = tls
+    transport = _singbox_transport(m)
+    if transport:
+        out["transport"] = transport
     return out
 
 
-def build_singbox_config(
-    outbound_node: Dict[str, Any],
-    proxy_domains: List[Dict[str, Any]],
-    proxy_username: str = "",
-    proxy_password: str = "",
-    dns_servers: Optional[List[Dict[str, Any]]] = None,
-    dns_rules: Optional[List[Dict[str, Any]]] = None,
-    dns_final: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Build full sing-box config: inbounds (hybrid + full, ports from env), outbounds (proxy + direct), route rules.
-    proxy_domains: list of {"type": "domain"|"suffix"|"keyword"|"regex", "value": "..."}
-    When proxy_username and proxy_password are both non-empty, HTTP and SOCKS inbounds require auth.
-    """
-    # If node has v2ray-style params, always use parsed path so transport/tls are built from params
-    if outbound_node.get("params") and _is_singbox_outbound(outbound_node):
-        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
-    elif _is_singbox_outbound(outbound_node):
-        proxy_out = _normalize_singbox_outbound(outbound_node, tag="proxy")
-    else:
-        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
-    if not proxy_out:
-        raise ValueError("Unsupported node type or invalid node. Use a share link (vmess://, vless://, ...) or a sing-box outbound JSON with type, server, server_port.")
-
-    rules = []
-    for d in proxy_domains:
-        rule_type = d.get("type", "domain")
-        value = d.get("value", "").strip()
-        value_lower = value.lower()
-        outbound_tag = d.get("outbound", "proxy")
-        if not value:
-            continue
-        rule = {"action": "route", "outbound": outbound_tag}
-        if rule_type == "exact":
-            rule["domain"] = [value_lower]
-        elif rule_type == "domain_suffix":
-            # Domain + subdomains: match apex domain exactly and all subdomains via suffix
-            suffix = value_lower if value_lower.startswith(".") else f".{value_lower}"
-            rules.append({"action": "route", "outbound": outbound_tag, "domain": [value_lower]})
-            rule["domain_suffix"] = [suffix]
-        elif rule_type == "contains":
-            rule["domain_keyword"] = [value_lower]
-        elif rule_type == "regex":
-            rule["domain_regex"] = [value]
-        elif rule_type == "domain":
-            rule["domain"] = [value_lower]
-            rules.append({"action": "route", "outbound": outbound_tag, "domain_suffix": [f".{value_lower}"]})
-        elif rule_type == "suffix":
-            rule["domain_suffix"] = [value_lower if value_lower.startswith(".") else f".{value_lower}"]
-        elif rule_type == "keyword":
-            rule["domain_keyword"] = [value_lower]
-        else:
-            rule["domain_regex"] = [value]
-        rules.append(rule)
-
-    # Use provided DNS settings or defaults
-    dns_servers = dns_servers or [
-        {"tag": "local_local", "address": "223.5.5.5"},
-        {
-            "tag": "remote_dns",
-            "address": "https://cloudflare-dns.com/dns-query",
-            "detour": "proxy",
-            "address_resolver": "local_local",
-        },
-        {
-            "tag": "direct_dns",
-            "address": "https://dns.alidns.com/dns-query",
-            "address_resolver": "local_local",
-        },
-    ]
-    dns_rules = dns_rules or [
-        {"server": "direct_dns", "domain_suffix": ["alidns.com", "doh.pub", "dot.pub", "360.cn", "onedns.net"]},
-    ]
-    dns_final_server = dns_final or "remote_dns"
-    dns_block = {
-        "servers": dns_servers,
-        "rules": dns_rules,
-        "final": dns_final_server,
-        "independent_cache": True,
-    }
-
-    config = {
-        "log": {"level": "info", "timestamp": True},
-        "dns": dns_block,
-        "inbounds": [],
-        "outbounds": [
-            proxy_out,
-            {"type": "direct", "tag": "direct"},
-        ],
-        "route": {
-            "rules": rules,
-            "final": "direct",
-        },
-    }
-    if os.environ.get(SINGBOX_CLASH_API_ENV, "").strip().lower() in ("1", "true", "yes"):
-        config["experimental"] = {
-            "clash_api": {"external_controller": "127.0.0.1:%s" % SINGBOX_CLASH_API_PORT},
+# --- Xray ---------------------------------------------------------------------------------------
+def _xray_stream(m: Dict[str, Any]) -> Dict[str, Any]:
+    net = m.get("network") or "tcp"
+    st: Dict[str, Any] = {"network": net, "security": m.get("security") or "none"}
+    sni = m.get("sni") or m.get("host") or m["server"]
+    if st["security"] == "tls":
+        tls: Dict[str, Any] = {"serverName": sni}
+        if m.get("pinned_cert_sha256"):
+            tls["pinnedPeerCertSha256"] = m["pinned_cert_sha256"]
+        elif m.get("insecure"):
+            # Xray 25+ removed allowInsecure: skipping certificate checks needs a pinned certificate hash
+            raise ValueError(
+                "This node skips TLS certificate checks (allowInsecure), which Xray no longer supports; "
+                "add the certificate's SHA-256 as pcs= in the link, or switch the core to sing-box"
+            )
+        if m.get("alpn"):
+            tls["alpn"] = m["alpn"]
+        if m.get("fingerprint"):
+            tls["fingerprint"] = m["fingerprint"]
+        st["tlsSettings"] = tls
+    elif st["security"] == "reality":
+        if not m.get("reality_public_key"):
+            raise ValueError("Reality node without a public key (pbk)")
+        st["realitySettings"] = {
+            "serverName": sni, "fingerprint": m.get("fingerprint") or "chrome",
+            "publicKey": m["reality_public_key"], "shortId": m.get("reality_short_id", ""),
+            "spiderX": m.get("reality_spider_x", ""),
         }
-    return apply_proxy_layout(config, "sing-box", proxy_username, proxy_password)
+    path, host = m.get("path") or "/", m.get("host") or ""
+    if net == "tcp":
+        if m.get("header_type") == "http":
+            st["tcpSettings"] = {"header": {"type": "http", "request": {
+                "version": "1.1", "method": "GET", "path": [path],
+                "headers": {"Host": [host or sni], "User-Agent": ["Mozilla/5.0"], "Accept-Encoding": ["gzip, deflate"],
+                            "Connection": ["keep-alive"], "Pragma": ["no-cache"]},
+            }}}
+    elif net == "ws":
+        st["wsSettings"] = {"path": path, "host": host}  # Xray reads "?ed=N" in the path as early data
+    elif net == "grpc":
+        st["grpcSettings"] = {"serviceName": m.get("service_name") or "", "multiMode": m.get("mode") == "multi"}
+    elif net == "httpupgrade":
+        st["httpupgradeSettings"] = {"path": path, "host": host}
+    elif net == "xhttp":
+        st["xhttpSettings"] = {"path": path, "host": host, "mode": m.get("mode") or "auto"}
+    elif net == "h2":
+        raise ValueError("Xray removed the HTTP/2 (h2) transport; switch the core to sing-box or use xhttp")
+    else:
+        raise ValueError(f"The {net} transport isn't supported")
+    return st
 
 
-def write_config(config: Dict[str, Any], path: str) -> None:
-    """Write config JSON to file."""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(config, f, indent=2, ensure_ascii=False)
+def xray_outbound(node: Dict[str, Any], tag: str) -> Dict[str, Any]:
+    """Xray outbound for any node shape."""
+    if node_kind(node) == "xray":  # pasted Xray JSON: keep every field
+        out = {k: v for k, v in node.items() if k not in ("raw", "remark", "name")}
+        out["tag"] = tag
+        return out
+    m = to_model(node)
+    if m["type"] == "shadowsocks":
+        if m.get("plugin"):
+            raise ValueError("Shadowsocks plugins only work on sing-box; switch the core to sing-box")
+        return {"protocol": "shadowsocks", "tag": tag, "settings": {"servers": [{
+            "address": m["server"], "port": m["server_port"], "method": m["method"], "password": m["password"]}]}}
+    if m["type"] in ("vless", "vmess"):
+        user: Dict[str, Any] = {"id": m["uuid"]}
+        if m["type"] == "vless":
+            user["encryption"] = "none"
+            if m.get("flow"):
+                user["flow"] = m["flow"]
+        else:
+            user.update({"alterId": m.get("alter_id", 0), "security": m.get("vmess_security") or "auto"})
+        settings = {"vnext": [{"address": m["server"], "port": m["server_port"], "users": [user]}]}
+    else:
+        settings = {"servers": [{"address": m["server"], "port": m["server_port"], "password": m["password"]}]}
+    return {"protocol": m["type"], "tag": tag, "settings": settings, "streamSettings": _xray_stream(m)}
 
 
 # --- Minimal config for latency test: single node, HTTP inbound on temp port, all traffic via proxy ---
 LATENCY_TEST_HTTP_PORT = 19099
 
 
-def build_minimal_singbox_config(outbound_node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
-    """Build a minimal sing-box config with one node and one HTTP inbound. Used for real latency test in a separate process."""
-    if outbound_node.get("params") and _is_singbox_outbound(outbound_node):
-        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
-    elif _is_singbox_outbound(outbound_node):
-        proxy_out = _normalize_singbox_outbound(outbound_node, tag="proxy")
-    else:
-        proxy_out = parsed_to_singbox_outbound(outbound_node, tag="proxy")
-    if not proxy_out:
-        raise ValueError("Unsupported node type or invalid node.")
-    listen_fields = {"sniff": True, "sniff_override_destination": True}
-    dns_servers = [
-        {"tag": "local_local", "address": "223.5.5.5"},
-        {
-            "tag": "remote_dns",
-            "address": "https://cloudflare-dns.com/dns-query",
-            "detour": "proxy",
-            "address_resolver": "local_local",
-        },
-    ]
+def build_minimal_singbox_config(node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
+    """Minimal sing-box config with one node and one HTTP inbound, for the real latency test."""
     return {
         "log": {"level": "warn", "timestamp": True},
-        "dns": {"servers": dns_servers, "final": "remote_dns", "independent_cache": True},
-        "inbounds": [
-            {
-                "type": "http",
-                "tag": "http-in",
-                "listen": "127.0.0.1",
-                "listen_port": http_port,
-                **listen_fields,
-            },
-        ],
-        "outbounds": [proxy_out, {"type": "direct", "tag": "direct"}],
+        "dns": {
+            "servers": [
+                {"tag": "local", "address": "223.5.5.5", "detour": "direct"},
+                {"tag": "remote", "address": "https://cloudflare-dns.com/dns-query", "detour": "proxy", "address_resolver": "local"},
+            ],
+            # The node's own hostname must resolve outside the node, or the lookup loops through it
+            "rules": [{"outbound": "any", "server": "local"}],
+            "final": "remote",
+            "independent_cache": True,
+        },
+        "inbounds": [{"type": "http", "tag": "http-in", "listen": "127.0.0.1", "listen_port": http_port}],
+        "outbounds": [singbox_outbound(node, "proxy"), {"type": "direct", "tag": "direct"}],
         "route": {"rules": [], "final": "proxy"},
     }
 
 
-def build_minimal_xray_config(outbound_node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
-    """Build a minimal Xray config with one node and one HTTP inbound. Used for real latency test in a separate process."""
-    if _is_singbox_outbound(outbound_node):
-        node = dict(outbound_node)
-        node["type"] = node.get("type")
-        node["server"] = node.get("server")
-        node["add"] = node.get("server")
-        node["port"] = node.get("server_port") or node.get("port")
-        node["server_port"] = node.get("server_port") or node.get("port")
-        node["uuid"] = node.get("uuid") or node.get("id")
-        node["id"] = node.get("uuid") or node.get("id")
-        proxy_out = _parsed_to_xray_outbound(node, tag="proxy")
-    else:
-        proxy_out = _parsed_to_xray_outbound(outbound_node, tag="proxy")
-    if not proxy_out:
-        raise ValueError("Unsupported node type or invalid node.")
-    sniff = {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}
-
-    # Minimal DNS configuration for latency test
-    dns_config = {
-        "servers": [
-            {"address": "223.5.5.5", "tag": "local_dns", "detour": "direct"},
-            {
-                "address": "https://1.1.1.1/dns-query",
-                "tag": "remote_dns",
-                "detour": "proxy",
-                "addressResolver": "local_dns"
-            }
-        ],
-        "final": "remote_dns"
-    }
-
+def build_minimal_xray_config(node: Dict[str, Any], http_port: int = LATENCY_TEST_HTTP_PORT) -> Dict[str, Any]:
+    """Minimal Xray config with one node and one HTTP inbound, for the real latency test."""
     return {
         "log": {"loglevel": "warning"},
-        "dns": dns_config,
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": http_port,
-                "protocol": "http",
-                "settings": {},
-                "tag": "http-in",
-                "sniffing": sniff,
-            },
-        ],
-        "outbounds": [
-            {"protocol": "freedom", "tag": "direct"},
-            proxy_out,
-        ],
+        "inbounds": [{"listen": "127.0.0.1", "port": http_port, "protocol": "http", "settings": {}, "tag": "http-in"}],
+        "outbounds": [xray_outbound(node, "proxy"), {"protocol": "freedom", "tag": "direct"}],
         "routing": {"domainStrategy": "AsIs", "rules": [{"type": "field", "network": "tcp,udp", "outboundTag": "proxy"}]},
     }
 
 
-# --- Xray config (same inbounds: HTTP + SOCKS; routing by domain; outbound from parsed node) ---
+# --- All nodes in one config: switch without restarts, pick the fastest, pool connections ---
+NODE_TAG_PREFIX = "node-"
+MULTIPLEX_PROTOCOLS = ("h2mux", "smux", "yamux")
 
 
-def _xray_stream_settings(node: Dict[str, Any]) -> Dict[str, Any]:
-    """Build Xray streamSettings from parsed node (network, security, ws/grpc/tcp+http/tls)."""
-    net = (node.get("net") or node.get("type") or "tcp").lower()
-    server = node.get("server") or node.get("add")
-    sni = node.get("sni") or node.get("host") or server
-    use_tls = node.get("tls") in ("tls", "1", True) or node.get("security") == "tls"
-    header_type = (node.get("headerType") or "").lower()
-
-    # Xray: type=tcp&headerType=http → TCP with HTTP disguise (tcpSettings.header.type "http")
-    if header_type == "http" and (node.get("host") or node.get("path")):
-        path = (node.get("path") or "/").strip() or "/"
-        host = (node.get("host") or "").strip()
-        stream: Dict[str, Any] = {
-            "network": "tcp",
-            "security": "tls" if use_tls else "none",
-            "tcpSettings": {
-                "header": {
-                    "type": "http",
-                    "request": {
-                        "version": "1.1",
-                        "method": "GET",
-                        "path": [path],
-                        "headers": {
-                            "Host": [host] if host else ["localhost"],
-                            "User-Agent": ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"],
-                            "Accept-Encoding": ["gzip", "deflate"],
-                            "Connection": ["keep-alive"],
-                            "Pragma": "no-cache",
-                        },
-                    },
-                },
-            },
-        }
-        if use_tls and sni:
-            stream["tlsSettings"] = {"serverName": sni, "allowInsecure": False}
-        return stream
-
-    # Xray network: tcp (raw), ws, grpc; http/h2 map to tcp+tls
-    if net in ("http", "h2"):
-        net = "tcp"
-    stream = {
-        "network": "tcp" if net in ("tcp", "tls") else net,
-        "security": "tls" if use_tls else "none",
-    }
-    if use_tls and sni:
-        stream["tlsSettings"] = {"serverName": sni, "allowInsecure": False}
-    if net == "ws":
-        path = node.get("path") or "/"
-        headers = dict(node.get("headers") or {})
-        if node.get("host") and "Host" not in headers:
-            headers["Host"] = node["host"]
-        stream["wsSettings"] = {"path": path, "headers": headers}
-    if net == "grpc":
-        stream["grpcSettings"] = {
-            "serviceName": node.get("serviceName") or node.get("path") or "grpc",
-        }
-    return stream
+def node_tag(node_id: int) -> str:
+    return f"{NODE_TAG_PREFIX}{node_id}"
 
 
-def _parsed_to_xray_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dict[str, Any] | None:
-    """Convert parsed node to Xray outbound (protocol + settings + streamSettings)."""
-    _apply_params_to_node(node)
-    t = node.get("type")
-    server = node.get("server") or node.get("add")
-    port = int(node.get("server_port") or node.get("port") or 443)
-    stream = _xray_stream_settings(node)
-
-    if t == "vless":
-        flow = (node.get("params") or {}).get("flow")
-        flow_val = flow[0] if isinstance(flow, list) and flow else (flow or "")
-        user: Dict[str, Any] = {
-            "id": node.get("uuid", ""),
-            "encryption": "none",
-        }
-        if flow_val:
-            user["flow"] = flow_val
-        settings: Dict[str, Any] = {
-            "vnext": [
-                {"address": server, "port": port, "users": [user]},
-            ]
-        }
-        out: Dict[str, Any] = {
-            "protocol": "vless",
-            "tag": tag,
-            "settings": settings,
-            "streamSettings": stream,
-            "mux": {"enabled": False, "concurrency": -1},
-        }
-        return out
-
-    if t == "vmess":
-        return {
-            "protocol": "vmess",
-            "tag": tag,
-            "settings": {
-                "vnext": [
-                    {
-                        "address": server,
-                        "port": port,
-                        "users": [
-                            {
-                                "id": node.get("id", ""),
-                                "security": "auto",
-                                "alterId": int(node.get("aid") or 0),
-                            }
-                        ],
-                    }
-                ]
-            },
-            "streamSettings": stream,
-        }
-
-    if t == "trojan":
-        return {
-            "protocol": "trojan",
-            "tag": tag,
-            "settings": {
-                "servers": [{"address": server, "port": port, "password": node.get("password", "")}]
-            },
-            "streamSettings": stream,
-        }
-
-    if t == "shadowsocks":
-        return {
-            "protocol": "shadowsocks",
-            "tag": tag,
-            "settings": {
-                "servers": [
-                    {
-                        "address": server,
-                        "port": port,
-                        "method": node.get("method", "aes-256-gcm"),
-                        "password": node.get("password", ""),
-                    }
-                ]
-            },
-        }
-
-    return None
+def _is_vision(outbound: Dict[str, Any]) -> bool:
+    return "vision" in str(outbound.get("flow") or "") or any(
+        "vision" in str(u.get("flow") or "")
+        for vnext in (outbound.get("settings") or {}).get("vnext", [])
+        for u in vnext.get("users", [])
+    )
 
 
-def build_xray_config(
-    outbound_node: Dict[str, Any],
-    proxy_domains: List[Dict[str, Any]],
-    proxy_username: str = "",
-    proxy_password: str = "",
-    dns_servers: Optional[List[Dict[str, Any]]] = None,
-    dns_rules: Optional[List[Dict[str, Any]]] = None,
-    dns_final: Optional[str] = None,
+def _singbox_node_outbound(node: Dict[str, Any], tag: str, multiplex: str, tcp_fast_open: bool) -> Dict[str, Any]:
+    out = singbox_outbound(node, tag)
+    # Vision (XTLS flow) cannot be multiplexed
+    if multiplex in MULTIPLEX_PROTOCOLS and not _is_vision(out):
+        out["multiplex"] = {"enabled": True, "protocol": multiplex, "max_connections": 4, "min_streams": 4}
+    if tcp_fast_open:
+        out["tcp_fast_open"] = True
+    return out
+
+
+def _xray_node_outbound(node: Dict[str, Any], tag: str, multiplex: str, tcp_fast_open: bool) -> Dict[str, Any]:
+    out = xray_outbound(node, tag)
+    if multiplex in MULTIPLEX_PROTOCOLS and not _is_vision(out):
+        out["mux"] = {"enabled": True, "concurrency": 8, "xudpConcurrency": 16, "xudpProxyUDP443": "reject"}
+    if tcp_fast_open:
+        out.setdefault("streamSettings", {}).setdefault("sockopt", {})["tcpFastOpen"] = True
+    return out
+
+
+def apply_node_outbounds(
+    config: Dict[str, Any],
+    core_type: str,
+    nodes: List[Dict[str, Any]],
+    mode: str,
+    active_id: Optional[int],
+    test_url: str,
+    tcp_fast_open: bool = False,
 ) -> Dict[str, Any]:
+    """Replace the node outbounds and the "proxy" group in config. Mutates and returns config.
+
+    nodes: [{"id", "parsed", "multiplex"}]. mode: "manual" (active_id is used) or "auto" (fastest node).
+    sing-box: every node is an outbound; "proxy" is a selector (manual, switchable live through the
+    Clash API) or a urltest (auto). Xray: manual keeps a single "proxy" outbound (switching restarts);
+    auto adds every node and a leastPing balancer tagged "proxy" fed by the observatory.
+    With no usable node, no "proxy" exists, so the full-tunnel ports stay closed.
     """
-    Build full Xray config: inbounds (hybrid + full, ports from env), outbounds (proxy + direct), routing rules.
-    proxy_domains: list of {"type": "domain"|"suffix"|"keyword"|"regex", "value": "..."}
-    When proxy_username and proxy_password are both non-empty, HTTP and SOCKS inbounds require auth.
-    dns_servers: list of DNS server configs (optional, uses defaults if not provided)
-    dns_rules: list of DNS routing rules (optional)
-    dns_final: final DNS server tag (optional, defaults to "remote_dns")
-    """
-    # Support raw sing-box outbound from manual paste: convert to our parsed shape then to Xray
-    if _is_singbox_outbound(outbound_node):
-        node = dict(outbound_node)
-        node["type"] = node.get("type")
-        node["server"] = node.get("server")
-        node["add"] = node.get("server")
-        node["port"] = node.get("server_port") or node.get("port")
-        node["server_port"] = node.get("server_port") or node.get("port")
-        node["uuid"] = node.get("uuid") or node.get("id")
-        node["id"] = node.get("uuid") or node.get("id")
-        proxy_out = _parsed_to_xray_outbound(node, tag="proxy")
+    outbounds = [
+        o for o in config.get("outbounds", [])
+        if not (isinstance(o, dict) and (o.get("tag") == "proxy" or str(o.get("tag", "")).startswith(NODE_TAG_PREFIX)))
+    ]
+    if core_type == "xray":
+        routing = config.setdefault("routing", {})
+        routing["balancers"] = [b for b in routing.get("balancers", []) if b.get("tag") != "proxy"]
+        if not routing["balancers"]:
+            routing.pop("balancers")
+        config.pop("observatory", None)
+
+    def usable(build, items, tag_for):
+        """Build outbounds, skipping nodes this core can't use (the active node must work)."""
+        built = []
+        for n in items:
+            try:
+                built.append(build(n["parsed"], tag_for(n), n["multiplex"], tcp_fast_open))
+            except ValueError:
+                if mode != "auto" and n["id"] == active_id:
+                    raise
+        return built
+
+    if mode == "auto":
+        chosen = nodes
     else:
-        proxy_out = _parsed_to_xray_outbound(outbound_node, tag="proxy")
-    if not proxy_out:
-        raise ValueError(
-            "Unsupported node type or invalid node. Use a share link (vmess://, vless://, ...) or a sing-box outbound JSON."
-        )
+        chosen = [n for n in nodes if n["id"] == active_id]
 
-    rules = []
-    for d in proxy_domains:
-        rule_type = d.get("type", "domain")
-        value = (d.get("value") or "").strip()
-        value_lower = value.lower()
-        outbound_tag = d.get("outbound", "proxy")
-        if not value:
-            continue
-        if rule_type == "exact":
-            rules.append({"type": "field", "domain": [f"full:{value_lower}"], "outboundTag": outbound_tag})
-        elif rule_type == "domain_suffix":
-            suffix = value_lower.lstrip(".") or value_lower
-            rules.append({"type": "field", "domain": [f"domain:{suffix}"], "outboundTag": outbound_tag})
-        elif rule_type == "contains":
-            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": outbound_tag})
-        elif rule_type == "regex":
-            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": outbound_tag})
-        elif rule_type == "domain":
-            rules.append({"type": "field", "domain": [f"domain:{value_lower}"], "outboundTag": outbound_tag})
-        elif rule_type == "suffix":
-            suffix = value_lower if value_lower.startswith(".") else f".{value_lower}"
-            rules.append({"type": "field", "domain": [f"domain:{suffix.lstrip('.')}"], "outboundTag": outbound_tag})
-        elif rule_type == "keyword":
-            rules.append({"type": "field", "domain": [f"keyword:{value_lower}"], "outboundTag": outbound_tag})
+    if chosen and core_type == "xray":
+        if mode == "auto":
+            outbounds += usable(_xray_node_outbound, chosen, lambda n: node_tag(n["id"]))
+            routing["balancers"] = routing.get("balancers", []) + [{
+                "tag": "proxy",
+                "selector": [NODE_TAG_PREFIX],
+                "strategy": {"type": "leastPing"},
+                "fallbackTag": node_tag(chosen[0]["id"]),
+            }]
+            config["observatory"] = {
+                "subjectSelector": [NODE_TAG_PREFIX],
+                "probeUrl": test_url,
+                "probeInterval": "1m",
+                "enableConcurrency": True,
+            }
         else:
-            rules.append({"type": "field", "domain": [f"regexp:{value}"], "outboundTag": outbound_tag})
-
-    # Explicit catch-all: send everything that did not match to direct (default first-outbound is direct, but this makes it explicit)
-    rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
-
-    # API inbound for stats (StatsService); route to api outbound (Xray creates it when api is set)
-    api_rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
-
-    # DNS configuration for Xray - use provided settings or defaults
-    dns_final_server = dns_final or "remote_dns"
-    dns_config = {
-        "servers": dns_servers or [
-            {
-                "address": "223.5.5.5",
-                "tag": "local_dns",
-                "detour": "direct"
-            },
-            {
-                "address": "https://1.1.1.1/dns-query",
-                "tag": "remote_dns",
-                "detour": "proxy",
-                "addressResolver": "local_dns"
-            },
-            {
-                "address": "https://8.8.8.8/dns-query",
-                "tag": "remote_dns_alt",
-                "detour": "direct",
-                "addressResolver": "local_dns"
+            outbounds += usable(_xray_node_outbound, chosen, lambda n: "proxy")
+    elif chosen:
+        if mode == "auto":
+            node_outs = usable(_singbox_node_outbound, chosen, lambda n: node_tag(n["id"]))
+            tags = [o["tag"] for o in node_outs]
+            group = {
+                "type": "urltest",
+                "tag": "proxy",
+                "outbounds": tags,
+                "url": test_url,
+                "interval": "1m",
+                "tolerance": 50,
+                "idle_timeout": "30m",
+                "interrupt_exist_connections": False,
             }
-        ],
-        "rules": dns_rules or [
-            {
-                "type": "field",
-                "domain": ["domain:doh.pub", "domain:dot.pub", "domain:alidns.com", "domain:360.cn", "domain:onedns.net"],
-                "server": "remote_dns_alt"
+        else:
+            # Selector holds every node so "Use" can switch live without a restart
+            node_outs = usable(_singbox_node_outbound, nodes, lambda n: node_tag(n["id"]))
+            tags = [o["tag"] for o in node_outs]
+            group = {
+                "type": "selector",
+                "tag": "proxy",
+                "outbounds": tags,
+                "default": node_tag(active_id),
+                "interrupt_exist_connections": False,
             }
-        ],
-        "final": dns_final_server,
-        "disableCache": False,
-        "disableExpire": False
-    }
-
-    config = {
-        "log": {"loglevel": "warning"},
-        "dns": dns_config,
-        "stats": {},
-        "api": {"tag": "api", "services": ["StatsService"]},
-        "policy": {
-            "system": {
-                "statsInboundUplink": True,
-                "statsInboundDownlink": True,
-                "statsOutboundUplink": True,
-                "statsOutboundDownlink": True,
-            }
-        },
-        "inbounds": [],
-        "outbounds": [
-            {"protocol": "freedom", "tag": "direct"},
-            proxy_out,
-            {"protocol": "blackhole", "tag": "block"},
-        ],
-        "routing": {"domainStrategy": "AsIs", "rules": api_rules + rules},
-    }
-    return apply_proxy_layout(config, "xray", proxy_username, proxy_password)
+        if tags:
+            outbounds = [group] + node_outs + outbounds
+    config["outbounds"] = outbounds
+    return config

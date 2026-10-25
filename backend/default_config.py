@@ -55,6 +55,10 @@ def get_default_xray_config() -> Dict[str, Any]:
         "log": {
             "loglevel": "warning"
         },
+        # Stats API (loopback inbound added by the layout) so the Dashboard can show traffic
+        "stats": {},
+        "api": {"tag": "api", "services": ["StatsService"]},
+        "policy": {"system": {"statsInboundUplink": True, "statsInboundDownlink": True}},
         "dns": {
             "servers": [
                 {
@@ -81,8 +85,8 @@ def get_default_xray_config() -> Dict[str, Any]:
         ],
         "routing": {
             "domainStrategy": "AsIs",
-            "rules": [],
-            "final": "direct"
+            # Unmatched traffic uses the first outbound ("direct"); Xray has no "final" key
+            "rules": [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
         }
     }, "xray")
 

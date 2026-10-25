@@ -67,6 +67,8 @@ export const auth = {
   me: () => api<{ username: string }>('/api/auth/me'),
 }
 
+export type Multiplex = 'off' | 'h2mux' | 'smux' | 'yamux'
+
 export const settings = {
   get: () =>
     api<{
@@ -76,6 +78,9 @@ export const settings = {
       proxy_display_host: string
       proxy_username: string
       proxy_password: string
+      node_mode: 'manual' | 'auto'
+      verbose_logs: boolean
+      tcp_fast_open: boolean
       use_custom_config: boolean
       custom_config: string
       dns_servers: string
@@ -83,6 +88,9 @@ export const settings = {
     }>('/api/settings'),
   update: (body: {
     core_type?: string
+    node_mode?: 'manual' | 'auto'
+    verbose_logs?: boolean
+    tcp_fast_open?: boolean
     latency_test_domain?: string
     proxy_display_host?: string
     proxy_username?: string
@@ -105,6 +113,7 @@ export const nodes = {
         latency_ms: number | null
         real_latency_ms: number | null
         last_check: string | null
+        multiplex: Multiplex
       }[]
     }>('/api/nodes'),
   add: (body: { share_link?: string; raw_json?: string; activate: boolean }) =>
@@ -113,16 +122,16 @@ export const nodes = {
       body: JSON.stringify(body),
     }),
   select: (raw_link: string, node_id?: number) =>
-    api<{ ok: boolean }>('/api/nodes/select', {
+    api<{ ok: boolean; live: boolean }>('/api/nodes/select', {
       method: 'POST',
       body: JSON.stringify({ raw_link, node_id }),
     }),
   ping: () =>
     api<{ results: { id: number; latency_ms: number | null }[] }>('/api/nodes/ping', { method: 'POST' }),
-  update: (id: number, raw_link: string) =>
+  update: (id: number, body: { raw_link?: string; multiplex?: Multiplex }) =>
     api<{ ok: boolean }>(`/api/nodes/${id}`, {
       method: 'PUT',
-      body: JSON.stringify({ raw_link }),
+      body: JSON.stringify(body),
     }),
   delete: (id: number) =>
     api<{ ok: boolean }>(`/api/nodes/${id}`, { method: 'DELETE' }),
@@ -178,6 +187,8 @@ export const status = {
       latency_test_domain: string
       selected_node_raw: string
       selected_node_name: string
+      node_mode: 'manual' | 'auto'
+      active_node_id: number | null
       selected_node_latency_ms: number | null
       selected_node_real_latency_ms: number | null
       usage: { connections: number | null; upload_bytes: number | null; download_bytes: number | null }

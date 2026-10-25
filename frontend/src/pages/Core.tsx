@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Checkbox } from '@/components/ui/checkbox'
 import {
   Select,
   SelectContent,
@@ -71,6 +72,10 @@ export default function Core() {
 
   // Latency test state
   const [latencyTestDomain, setLatencyTestDomain] = useState('')
+  const [verboseLogs, setVerboseLogs] = useState(false)
+  const [tcpFastOpen, setTcpFastOpen] = useState(false)
+  const [perfSaving, setPerfSaving] = useState<'verbose_logs' | 'tcp_fast_open' | null>(null)
+  const [perfMsg, setPerfMsg] = useState<string | null>(null)
   const [latencyTesting, setLatencyTesting] = useState(false)
   const [latencyResult, setLatencyResult] = useState<{
     latency_ms: number | null
@@ -95,6 +100,8 @@ export default function Core() {
     settingsApi.get().then((s) => {
       if (s.core_type === 'xray' || s.core_type === 'sing-box') setCoreType(s.core_type)
       setLatencyTestDomain(s.latency_test_domain || '')
+      setVerboseLogs(Boolean(s.verbose_logs))
+      setTcpFastOpen(Boolean(s.tcp_fast_open))
     }).catch(() => {})
   }
 
@@ -205,6 +212,22 @@ export default function Core() {
       load()
     } catch (e) {
       setSettingsSaveMsg(e instanceof Error ? e.message : 'Failed to update core type')
+    }
+  }
+
+  async function handlePerfToggle(key: 'verbose_logs' | 'tcp_fast_open', value: boolean) {
+    const set = key === 'verbose_logs' ? setVerboseLogs : setTcpFastOpen
+    set(value)
+    setPerfSaving(key)
+    setPerfMsg(null)
+    try {
+      await settingsApi.update({ [key]: value })
+      setPerfMsg('Saved. Core restarted.')
+    } catch (e) {
+      set(!value)
+      setPerfMsg(e instanceof Error ? e.message : 'Save failed')
+    } finally {
+      setPerfSaving(null)
     }
   }
 
@@ -394,7 +417,7 @@ export default function Core() {
       )}
 
       {/* One row: same-height panels */}
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-6 items-stretch">
         {/* Core control */}
         <div className="flex min-h-0">
           <Card className="flex h-full w-full flex-col">
@@ -545,6 +568,59 @@ export default function Core() {
                     )}
                   </div>
                 </div>
+              )}
+            </CardContent>
+          </Card>
+        </div>
+
+        {/* Performance */}
+        <div className="flex min-h-0">
+          <Card className="flex h-full w-full flex-col">
+            <CardHeader className="shrink-0 space-y-0 pb-2">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <CardTitle>Performance</CardTitle>
+                <Tooltip
+                  content="Each change rebuilds the core config and restarts the core. Node selection mode and connection pooling are on the Proxy page."
+                  side="top"
+                >
+                  <span className="shrink-0 text-muted-foreground cursor-help inline-flex">
+                    <Info className="h-4 w-4" />
+                  </span>
+                </Tooltip>
+              </div>
+            </CardHeader>
+            <CardContent className="flex-1 space-y-4 text-sm">
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="perf-verbose-logs"
+                    checked={verboseLogs}
+                    disabled={perfSaving !== null}
+                    onCheckedChange={(v) => handlePerfToggle('verbose_logs', v)}
+                  />
+                  <Label htmlFor="perf-verbose-logs" className="cursor-pointer font-normal">Detailed logs</Label>
+                </div>
+                <p className="pl-6 text-xs text-muted-foreground">
+                  Logs every connection. Useful for debugging; costs CPU under heavy load, so keep it off normally.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <Checkbox
+                    id="perf-tfo"
+                    checked={tcpFastOpen}
+                    disabled={perfSaving !== null}
+                    onCheckedChange={(v) => handlePerfToggle('tcp_fast_open', v)}
+                  />
+                  <Label htmlFor="perf-tfo" className="cursor-pointer font-normal">TCP Fast Open to nodes</Label>
+                </div>
+                <p className="pl-6 text-xs text-muted-foreground">
+                  Saves one round trip on repeat connections. Needs TFO enabled on this host and the node; some
+                  networks drop it, so turn it off if connections start failing.
+                </p>
+              </div>
+              {perfMsg && (
+                <p className={cn('text-xs', perfMsg.startsWith('Saved') ? 'text-emerald-600' : 'text-destructive')}>{perfMsg}</p>
               )}
             </CardContent>
           </Card>
