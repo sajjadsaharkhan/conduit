@@ -48,6 +48,14 @@ from url_utils import host_from_url
 from config_file_manager import ConfigFileManager
 from default_config import get_default_config, get_default_singbox_config, get_default_xray_config
 from migration import migrate_db_to_config
+from proxy_layout import (
+    FULL_HTTP_PORT,
+    HYBRID_HTTP_PORT,
+    PROXY_TAGS,
+    XRAY_API_PORT,
+    apply_proxy_layout,
+    proxy_ports,
+)
 
 
 # --- Auth dependency ---
@@ -137,6 +145,9 @@ async def lifespan(app: FastAPI):
 
     # Run one-time migration from DB to config file
     await migrate_db_to_config()
+    async with db_connection() as conn:
+        core_type = await _get_setting(await conn.cursor(), "core_type", "sing-box")
+    await _sync_config_layout(core_type)
 
     start_scheduler()
     # Run first refresh after a short delay
@@ -401,6 +412,26 @@ async def _get_setting(cursor, key: str, default: str) -> str:
     return row[0] if row else default
 
 
+async def _write_core_config(manager: ConfigFileManager, config: Dict[str, Any], core_type: str) -> None:
+    """Write the core config with env ports, proxy auth and the full-tunnel rule enforced."""
+    async with db_connection() as conn:
+        cursor = await conn.cursor()
+        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
+        proxy_password = await _get_setting(cursor, "proxy_password", "")
+    apply_proxy_layout(config, core_type, proxy_username, proxy_password)
+    manager.write_config(config)
+
+
+async def _sync_config_layout(core_type: str) -> None:
+    """Bring an existing config file in line with the env ports (e.g. after a port env var changed)."""
+    manager = get_config_manager(core_type)
+    try:
+        config = manager.read_config()
+    except FileNotFoundError:
+        return
+    await _write_core_config(manager, config, core_type)
+
+
 async def _apply_node_config(raw_link: str) -> None:
     """Apply node configuration by updating the config file's outbound section.
     Reads existing config (with domains, DNS, etc.) and only updates the proxy outbound."""
@@ -418,10 +449,7 @@ async def _apply_node_config(raw_link: str) -> None:
             if not parsed:
                 raise ValueError("Invalid or unknown node")
 
-        # Get settings
         core_type = await _get_setting(cursor, "core_type", "sing-box")
-        proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
-        proxy_password = await _get_setting(cursor, "proxy_password", "")
 
     manager = get_config_manager(core_type)
 
@@ -431,13 +459,10 @@ async def _apply_node_config(raw_link: str) -> None:
     except FileNotFoundError:
         config = get_default_xray_config() if core_type == "xray" else get_default_singbox_config()
 
-    # Always reset inbounds to the correct default structure
-    # This ensures ports and listen addresses are always correct
+    # Inbounds, proxy auth and the full-tunnel rule are rebuilt from env in _write_core_config
     if core_type == "sing-box":
-        default_config = get_default_singbox_config()
-        config["inbounds"] = default_config["inbounds"]
-        # Also set correct log level to suppress benign warnings
-        config["log"] = default_config["log"]
+        # Set correct log level to suppress benign warnings
+        config["log"] = get_default_singbox_config()["log"]
 
         # Update proxy outbound with the new node
         proxy_outbound = parsed_to_singbox_outbound(parsed)
@@ -449,25 +474,8 @@ async def _apply_node_config(raw_link: str) -> None:
             outbounds.append(proxy_outbound)
         config["outbounds"] = outbounds
 
-        # Update inbounds with proxy auth if credentials provided
-        if proxy_username and proxy_password:
-            for inbound in config.get("inbounds", []):
-                if inbound.get("type") in ("http", "socks"):
-                    inbound["users"] = [{
-                        "username": proxy_username,
-                        "password": proxy_password
-                    }]
-        else:
-            # Remove users if no auth
-            for inbound in config.get("inbounds", []):
-                if "users" in inbound:
-                    del inbound["users"]
-
         config_path = get_config_path()
     else:  # xray
-        default_config = get_default_xray_config()
-        config["inbounds"] = default_config["inbounds"]
-
         # Update proxy outbound with the new node
         proxy_outbound = parsed_to_xray_outbound(parsed)
         outbounds = config.get("outbounds", [])
@@ -478,25 +486,9 @@ async def _apply_node_config(raw_link: str) -> None:
             outbounds.append(proxy_outbound)
         config["outbounds"] = outbounds
 
-        # Update inbounds with proxy auth if credentials provided
-        if proxy_username and proxy_password:
-            for inbound in config.get("inbounds", []):
-                if inbound.get("protocol") in ("http", "socks"):
-                    inbound.setdefault("settings", {}).setdefault("users", [])
-                    inbound["settings"]["users"] = [{
-                        "user": proxy_username,
-                        "pass": proxy_password
-                    }]
-        else:
-            # Remove users if no auth
-            for inbound in config.get("inbounds", []):
-                if "settings" in inbound and "users" in inbound.get("settings", {}):
-                    del inbound["settings"]["users"]
-
         config_path = get_xray_config_path()
 
-    # Write updated config
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
     core_start(config_path, core_type)
 
 
@@ -784,7 +776,7 @@ async def add_domain(
         config[rules_key]["rules"] = []
 
     config[rules_key]["rules"].append(new_rule)
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
 
     await _reapply_config_if_node_selected()
 
@@ -813,7 +805,7 @@ async def delete_domain(
     rules = config.get(rules_key, {}).get("rules", [])
     if 0 <= domain_id < len(rules):
         rules.pop(domain_id)
-        manager.write_config(config)
+        await _write_core_config(manager, config, core_type)
         await _reapply_config_if_node_selected()
         return {"ok": True}
     else:
@@ -878,7 +870,7 @@ async def bulk_add_domains(
         new_rule = _domain_to_routing_rule(type_, value, body.outbound, core_type)
         config[rules_key]["rules"].append(new_rule)
 
-    manager.write_config(config)
+    await _write_core_config(manager, config, core_type)
     await _reapply_config_if_node_selected()
 
     return {"added": len(pairs), "message": f"Added {len(pairs)} domain rule(s)."}
@@ -946,14 +938,11 @@ def _usage_for_pid(pid: int | None) -> dict:
     return out
 
 
-XRAY_STATS_API_PORT = 10085
-
-
 def _xray_traffic_bytes() -> tuple[int | None, int | None]:
-    """Query Xray stats API; return (upload_bytes, download_bytes) for inbounds http-in + socks-in, or (None, None)."""
+    """Query Xray stats API; return (upload_bytes, download_bytes) for the proxy inbounds, or (None, None)."""
     try:
         r = subprocess.run(
-            [XRAY_BIN, "api", "statsquery", "--server=127.0.0.1:%s" % XRAY_STATS_API_PORT],
+            [XRAY_BIN, "api", "statsquery", "--server=127.0.0.1:%s" % XRAY_API_PORT],
             capture_output=True,
             timeout=5,
             text=True,
@@ -972,7 +961,7 @@ def _xray_traffic_bytes() -> tuple[int | None, int | None]:
                 continue
             if not name.endswith(">>>traffic>>>uplink") and not name.endswith(">>>traffic>>>downlink"):
                 continue
-            if "inbound>>>http-in>>>" in name or "inbound>>>socks-in>>>" in name:
+            if any(f"inbound>>>{tag}>>>" in name for tag in PROXY_TAGS):
                 if name.endswith(">>>traffic>>>uplink"):
                     upload += value
                 else:
@@ -1014,40 +1003,6 @@ def _singbox_traffic_bytes() -> tuple[int | None, int | None]:
 
 
 # --- Core status and control ---
-def _get_ports_from_config(core_type: str) -> tuple[int, int]:
-    """Get http and socks ports from config file. Returns (http_port, socks_port)."""
-    try:
-        manager = get_config_manager(core_type)
-        config = manager.read_config()
-        inbounds = config.get("inbounds", [])
-        http_port = 8080
-        socks_port = 1080
-
-        for inbound in inbounds:
-            if core_type == "sing-box":
-                inbound_type = inbound.get("type", "")
-                port = inbound.get("listen_port", 8080)
-                if inbound_type == "http":
-                    http_port = port
-                elif inbound_type == "socks":
-                    socks_port = port
-                elif inbound_type == "mixed":
-                    # Mixed type handles both HTTP and SOCKS on same port
-                    http_port = port
-                    socks_port = port
-            else:  # xray
-                protocol = inbound.get("protocol", "")
-                port = inbound.get("port", 8080)
-                if protocol == "http":
-                    http_port = port
-                elif protocol == "socks":
-                    socks_port = port
-        return (http_port, socks_port)
-    except FileNotFoundError:
-        # Config file doesn't exist, return defaults
-        return (8080, 1080)
-
-
 @app.get("/api/status")
 async def status(username: str = Depends(get_current_user)):
     st = core_status()
@@ -1086,14 +1041,10 @@ async def status(username: str = Depends(get_current_user)):
             if down is not None:
                 usage["download_bytes"] = down
 
-    # Get ports from config file
-    http_port, socks_port = _get_ports_from_config(settings.get("core_type", "sing-box"))
-
     return {
         "core": st,
         "core_type": settings.get("core_type", "sing-box"),
-        "http_port": http_port,
-        "socks_port": socks_port,
+        **proxy_ports(),
         "proxy_display_host": settings.get("proxy_display_host", "127.0.0.1"),
         "proxy_username": (settings.get("proxy_username") or "").strip() or "",
         "proxy_password": settings.get("proxy_password") or "",
@@ -1119,6 +1070,7 @@ async def core_start_api(username: str = Depends(get_current_user)):
     if not Path(path).exists():
         await refresh_and_apply()
         return {"ok": True, "running": core_status()["running"]}
+    await _sync_config_layout(core_type)
     ok = core_start(path, core_type)
     return {"ok": ok, "running": core_status()["running"]}
 
@@ -1135,6 +1087,7 @@ async def core_restart_api(username: str = Depends(get_current_user)):
     settings_res = await get_settings(username)
     core_type = settings_res.get("core_type", "sing-box")
     path = get_xray_config_path() if core_type == "xray" else get_config_path()
+    await _sync_config_layout(core_type)
     core_restart(path, core_type)
     return {"ok": True, "running": core_status()["running"]}
 
@@ -1160,7 +1113,10 @@ async def core_latency_test(
     if not url:
         raise HTTPException(status_code=400, detail="No test URL. Set a URL in Core → Latency test and save.")
     core_type = settings_res.get("core_type", "sing-box")
-    http_port, _ = _get_ports_from_config(core_type)
+    # Prefer the full-tunnel port so the test always measures the node, whatever the Domains rules say
+    http_port = FULL_HTTP_PORT or HYBRID_HTTP_PORT
+    if http_port is None:
+        raise HTTPException(status_code=400, detail="No HTTP proxy port is enabled")
     proxy_username = (settings_res.get("proxy_username") or "").strip()
     proxy_password = settings_res.get("proxy_password") or ""
     result = await asyncio.to_thread(run_latency_test, url, http_port, proxy_username, proxy_password)
@@ -1284,11 +1240,13 @@ async def update_config_section(
         if section_name == "all":
             if not isinstance(section_data, dict):
                 raise HTTPException(status_code=400, detail="Config data must be a dict when updating 'all'")
-            manager.write_config(section_data)
+            await _write_core_config(manager, section_data, core_type)
             return {"ok": True, "message": "Full config updated successfully"}
 
-        # Update section in config file
-        manager.update_section(section_name, section_data)
+        # Update section in config file (inbounds always follow the env ports)
+        config = manager.read_config()
+        config[section_name] = section_data
+        await _write_core_config(manager, config, core_type)
 
         return {"ok": True, "message": f"Section '{section_name}' updated successfully"}
     except FileNotFoundError:

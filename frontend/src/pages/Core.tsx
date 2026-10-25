@@ -477,7 +477,7 @@ export default function Core() {
                   Latency test
                 </CardTitle>
                 <Tooltip
-                  content="Download the test URL via the proxy to measure real latency (time to first byte) and download speed. Save the URL first, then run the test. The request goes through your current proxy (HTTP on port 8080)."
+                  content="Download the test URL via the proxy to measure real latency (time to first byte) and download speed. Save the URL first, then run the test. The request goes through the full-tunnel HTTP port, so it always measures the selected node."
                   side="top"
                 >
                   <span className="shrink-0 text-muted-foreground cursor-help inline-flex">

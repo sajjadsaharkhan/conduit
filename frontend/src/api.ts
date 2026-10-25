@@ -71,8 +71,6 @@ export const settings = {
   get: () =>
     api<{
       subscription_url: string
-      http_port: number
-      socks_port: number
       core_type: string
       last_refresh: string
       selected_node_raw: string
@@ -89,8 +87,6 @@ export const settings = {
     }>('/api/settings'),
   update: (body: {
     subscription_url?: string
-    http_port?: number
-    socks_port?: number
     core_type?: string
     refresh_interval_minutes?: number
     auto_switch_best?: boolean
@@ -183,8 +179,11 @@ export const status = {
     api<{
       core: { running: boolean; pid: number | null; started_at: number | null }
       core_type: string
-      http_port: number
-      socks_port: number
+      web_port: number | null
+      hybrid_http_port: number | null
+      full_http_port: number | null
+      hybrid_socks_port: number | null
+      full_socks_port: number | null
       proxy_display_host: string
       proxy_username: string
       proxy_password: string

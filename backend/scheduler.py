@@ -37,12 +37,6 @@ async def _get_proxy_domains(cursor) -> list:
     return domains
 
 
-async def _get_http_socks_ports(cursor) -> tuple:
-    http_port = await _get_setting(cursor, "http_port", "8080")
-    socks_port = await _get_setting(cursor, "socks_port", "1080")
-    return int(http_port), int(socks_port)
-
-
 async def refresh_and_apply() -> None:
     """Fetch subscription, parse nodes, latency check; if auto_switch_best, pick best and apply config."""
     try:
@@ -139,15 +133,14 @@ async def refresh_and_apply() -> None:
                 logger.info("Selected node not in list and not in DB, skip apply")
                 return
             domains = await _get_proxy_domains(cursor)
-            http_port, socks_port = await _get_http_socks_ports(cursor)
             core_type = await _get_setting(cursor, "core_type", "sing-box")
             proxy_username = (await _get_setting(cursor, "proxy_username", "")).strip()
             proxy_password = await _get_setting(cursor, "proxy_password", "")
             if core_type == "xray":
-                config = build_xray_config(current, domains, http_port, socks_port, proxy_username, proxy_password)
+                config = build_xray_config(current, domains, proxy_username, proxy_password)
                 config_path = get_xray_config_path()
             else:
-                config = build_singbox_config(current, domains, http_port=http_port, socks_port=socks_port, proxy_username=proxy_username, proxy_password=proxy_password)
+                config = build_singbox_config(current, domains, proxy_username=proxy_username, proxy_password=proxy_password)
                 config_path = get_config_path()
             write_config(config, config_path)
             core_start(config_path, core_type)

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
-import { settings, subscription, nodes as nodesApi, manual } from '../api'
+import { settings, subscription, nodes as nodesApi, manual, status as statusApi } from '../api'
+import { ProxyEndpoints } from '@/components/ProxyEndpoints'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -62,6 +63,7 @@ export default function Proxy() {
   }>>({})
   const [testingAllNodes, setTestingAllNodes] = useState(false)
   const [latencySort, setLatencySort] = useState<'asc' | 'desc' | null>(null)
+  const [proxyStatus, setProxyStatus] = useState<Awaited<ReturnType<typeof statusApi.get>> | null>(null)
 
   function loadSettings() {
     settings.get().then((d) => {
@@ -72,6 +74,7 @@ export default function Proxy() {
 
   function load() {
     setLoading(true)
+    statusApi.get().then(setProxyStatus).catch(() => {})
     Promise.all([settings.get(), nodesApi.list()]).then(([setRes, nodesRes]) => {
       setSubscriptionUrl(setRes.subscription_url)
       setLastRefresh(setRes.last_refresh || '')
@@ -265,13 +268,23 @@ export default function Proxy() {
     <div className="space-y-6">
       <div>
         <h1 className="text-3xl font-bold tracking-tight">Proxy</h1>
-        <p className="text-muted-foreground">Subscription, nodes, and manual config</p>
+        <p className="text-muted-foreground">Endpoints, subscription, nodes, and manual config</p>
       </div>
 
       {message !== null && (
         <Alert variant={messageSuccess ? 'success' : 'destructive'}>
           <AlertDescription>{message}</AlertDescription>
         </Alert>
+      )}
+
+      {proxyStatus && (
+        <ProxyEndpoints
+          ports={proxyStatus}
+          host={proxyStatus.proxy_display_host || '127.0.0.1'}
+          username={(proxyStatus.proxy_username || '').trim()}
+          password={proxyStatus.proxy_password || ''}
+          nodeSelected={Boolean(selectedRaw)}
+        />
       )}
 
       <Tabs value={tab} onValueChange={setTab}>

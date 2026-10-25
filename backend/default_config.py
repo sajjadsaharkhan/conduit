@@ -1,10 +1,12 @@
 """Default configuration generators for sing-box and Xray."""
 from typing import Dict, Any
 
+from proxy_layout import apply_proxy_layout
+
 
 def get_default_singbox_config() -> Dict[str, Any]:
     """Generate default sing-box configuration."""
-    return {
+    return apply_proxy_layout({
         "log": {
             "level": "info",
             "timestamp": True
@@ -28,24 +30,7 @@ def get_default_singbox_config() -> Dict[str, Any]:
             "final": "remote",
             "independent_cache": True
         },
-        "inbounds": [
-            {
-                "type": "http",
-                "tag": "http-in",
-                "listen": "0.0.0.0",
-                "listen_port": 8080,
-                "sniff": True,
-                "sniff_override_destination": True
-            },
-            {
-                "type": "socks",
-                "tag": "socks-in",
-                "listen": "0.0.0.0",
-                "listen_port": 1080,
-                "sniff": True,
-                "sniff_override_destination": True
-            }
-        ],
+        "inbounds": [],
         "outbounds": [
             {
                 "type": "direct",
@@ -61,12 +46,12 @@ def get_default_singbox_config() -> Dict[str, Any]:
             "final": "direct",
             "auto_detect_interface": True
         }
-    }
+    }, "sing-box")
 
 
 def get_default_xray_config() -> Dict[str, Any]:
     """Generate default xray configuration."""
-    return {
+    return apply_proxy_layout({
         "log": {
             "loglevel": "warning"
         },
@@ -83,28 +68,7 @@ def get_default_xray_config() -> Dict[str, Any]:
             ],
             "final": "remote"
         },
-        "inbounds": [
-            {
-                "tag": "http-in",
-                "port": 8080,
-                "listen": "0.0.0.0",
-                "protocol": "http",
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls"]
-                }
-            },
-            {
-                "tag": "socks-in",
-                "port": 1080,
-                "listen": "0.0.0.0",
-                "protocol": "socks",
-                "sniffing": {
-                    "enabled": True,
-                    "destOverride": ["http", "tls"]
-                }
-            }
-        ],
+        "inbounds": [],
         "outbounds": [
             {
                 "protocol": "freedom",
@@ -120,7 +84,7 @@ def get_default_xray_config() -> Dict[str, Any]:
             "rules": [],
             "final": "direct"
         }
-    }
+    }, "xray")
 
 
 def get_default_config(core_type: str) -> Dict[str, Any]:

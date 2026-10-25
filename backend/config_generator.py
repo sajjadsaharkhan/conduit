@@ -3,6 +3,8 @@ import json
 import os
 from typing import Dict, Any, List, Optional
 
+from proxy_layout import apply_proxy_layout
+
 # When set (e.g. SINGBOX_CLASH_API=1), add experimental Clash API so Dashboard can show upload/download for sing-box
 SINGBOX_CLASH_API_ENV = "SINGBOX_CLASH_API"
 SINGBOX_CLASH_API_PORT = 9092
@@ -216,8 +218,6 @@ def _normalize_singbox_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dic
 def build_singbox_config(
     outbound_node: Dict[str, Any],
     proxy_domains: List[Dict[str, Any]],
-    http_port: int = 8080,
-    socks_port: int = 1080,
     proxy_username: str = "",
     proxy_password: str = "",
     dns_servers: Optional[List[Dict[str, Any]]] = None,
@@ -225,7 +225,7 @@ def build_singbox_config(
     dns_final: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build full sing-box config: inbounds (http + socks), outbounds (proxy + direct), route rules.
+    Build full sing-box config: inbounds (hybrid + full, ports from env), outbounds (proxy + direct), route rules.
     proxy_domains: list of {"type": "domain"|"suffix"|"keyword"|"regex", "value": "..."}
     When proxy_username and proxy_password are both non-empty, HTTP and SOCKS inbounds require auth.
     """
@@ -270,14 +270,6 @@ def build_singbox_config(
             rule["domain_regex"] = [value]
         rules.append(rule)
 
-    # Sniff TLS/HTTP so routing sees the domain (SNI/Host), not the resolved IP.
-    listen_fields = {
-        "sniff": True,
-        "sniff_override_destination": True,
-    }
-    use_auth = bool((proxy_username or "").strip() and proxy_password is not None)
-    users = [{"username": (proxy_username or "").strip(), "password": proxy_password or ""}] if use_auth else []
-
     # Use provided DNS settings or defaults
     dns_servers = dns_servers or [
         {"tag": "local_local", "address": "223.5.5.5"},
@@ -304,28 +296,10 @@ def build_singbox_config(
         "independent_cache": True,
     }
 
-    http_in = {
-        "type": "http",
-        "tag": "http-in",
-        "listen": "0.0.0.0",
-        "listen_port": http_port,
-        **listen_fields,
-    }
-    if users:
-        http_in["users"] = users
-    socks_in = {
-        "type": "socks",
-        "tag": "socks-in",
-        "listen": "0.0.0.0",
-        "listen_port": socks_port,
-        **listen_fields,
-    }
-    if users:
-        socks_in["users"] = users
     config = {
         "log": {"level": "info", "timestamp": True},
         "dns": dns_block,
-        "inbounds": [http_in, socks_in],
+        "inbounds": [],
         "outbounds": [
             proxy_out,
             {"type": "direct", "tag": "direct"},
@@ -339,7 +313,7 @@ def build_singbox_config(
         config["experimental"] = {
             "clash_api": {"external_controller": "127.0.0.1:%s" % SINGBOX_CLASH_API_PORT},
         }
-    return config
+    return apply_proxy_layout(config, "sing-box", proxy_username, proxy_password)
 
 
 def write_config(config: Dict[str, Any], path: str) -> None:
@@ -589,8 +563,6 @@ def _parsed_to_xray_outbound(node: Dict[str, Any], tag: str = "proxy") -> Dict[s
 def build_xray_config(
     outbound_node: Dict[str, Any],
     proxy_domains: List[Dict[str, Any]],
-    http_port: int = 8080,
-    socks_port: int = 1080,
     proxy_username: str = "",
     proxy_password: str = "",
     dns_servers: Optional[List[Dict[str, Any]]] = None,
@@ -598,7 +570,7 @@ def build_xray_config(
     dns_final: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    Build full Xray config: inbounds (http + socks), outbounds (proxy + direct), routing rules.
+    Build full Xray config: inbounds (hybrid + full, ports from env), outbounds (proxy + direct), routing rules.
     proxy_domains: list of {"type": "domain"|"suffix"|"keyword"|"regex", "value": "..."}
     When proxy_username and proxy_password are both non-empty, HTTP and SOCKS inbounds require auth.
     dns_servers: list of DNS server configs (optional, uses defaults if not provided)
@@ -653,18 +625,7 @@ def build_xray_config(
     # Explicit catch-all: send everything that did not match to direct (default first-outbound is direct, but this makes it explicit)
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "direct"})
 
-    sniff = {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False}
-    use_auth = bool((proxy_username or "").strip() and proxy_password is not None)
-    http_settings: Dict[str, Any] = {}
-    if use_auth:
-        http_settings["accounts"] = [{"user": (proxy_username or "").strip(), "pass": proxy_password or ""}]
-    socks_settings: Dict[str, Any] = {"udp": True}
-    if use_auth:
-        # Xray SOCKS: auth "password" and accounts as array of {user, pass} (see xtls.github.io config/inbounds/socks)
-        socks_settings["auth"] = "password"
-        socks_settings["accounts"] = [{"user": (proxy_username or "").strip(), "pass": proxy_password or ""}]
     # API inbound for stats (StatsService); route to api outbound (Xray creates it when api is set)
-    api_port = 10085
     api_rules = [{"type": "field", "inboundTag": ["api"], "outboundTag": "api"}]
 
     # DNS configuration for Xray - use provided settings or defaults
@@ -714,31 +675,7 @@ def build_xray_config(
                 "statsOutboundDownlink": True,
             }
         },
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": api_port,
-                "protocol": "dokodemo-door",
-                "settings": {"address": "127.0.0.1"},
-                "tag": "api",
-            },
-            {
-                "listen": "0.0.0.0",
-                "port": http_port,
-                "protocol": "http",
-                "settings": http_settings,
-                "tag": "http-in",
-                "sniffing": sniff,
-            },
-            {
-                "listen": "0.0.0.0",
-                "port": socks_port,
-                "protocol": "socks",
-                "settings": socks_settings,
-                "tag": "socks-in",
-                "sniffing": sniff,
-            },
-        ],
+        "inbounds": [],
         "outbounds": [
             {"protocol": "freedom", "tag": "direct"},
             proxy_out,
@@ -746,4 +683,4 @@ def build_xray_config(
         ],
         "routing": {"domainStrategy": "AsIs", "rules": api_rules + rules},
     }
-    return config
+    return apply_proxy_layout(config, "xray", proxy_username, proxy_password)
