@@ -222,9 +222,11 @@ do_backup() {
   if container_running; then
     run docker exec "$CONTAINER" python3 -c "import sqlite3; s = sqlite3.connect('/data/conduit.db'); d = sqlite3.connect('/data/.backup-conduit.db'); s.backup(d); d.close()"
   fi
-  run docker run --rm --entrypoint tar -v "$vol:/data:ro" -v "$BACKUP_DIR:/backup" "$image" czf "/backup/$(basename "$BACKUP_FILE")" -C /data .
+  # tar runs as root in the container (it must read root-owned files such as .jwt_secret); hand the archive to
+  # the user running this script, private (it holds password hashes and node credentials)
+  run docker run --rm --entrypoint sh -v "$vol:/data:ro" -v "$BACKUP_DIR:/backup" "$image" -c \
+    "tar czf /backup/$(basename "$BACKUP_FILE") -C /data . && chown $(id -u):$(id -g) /backup/$(basename "$BACKUP_FILE") && chmod 600 /backup/$(basename "$BACKUP_FILE")"
   [ "$DRY_RUN" = 1 ] && return
-  chmod 600 "$BACKUP_FILE"
   log "saved $BACKUP_FILE ($(du -h "$BACKUP_FILE" | cut -f1))"
   # Keep the newest KEEP_BACKUPS archives
   ls -1t "$BACKUP_DIR"/conduit-data-*.tar.gz 2>/dev/null | tail -n +$((KEEP_BACKUPS + 1)) | while read -r old; do rm -f "$old"; done
