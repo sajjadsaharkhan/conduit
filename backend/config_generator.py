@@ -42,8 +42,8 @@ def _model_from_singbox(ob: Dict[str, Any]) -> Dict[str, Any]:
         "uuid": ob.get("uuid", ""), "password": ob.get("password", ""), "method": ob.get("method", ""),
         "plugin": ob.get("plugin", ""), "plugin_opts": ob.get("plugin_opts", ""),
         "alter_id": int(ob.get("alter_id") or 0), "vmess_security": ob.get("security", "auto"),
-        "flow": ob.get("flow", ""),
-        "network": network, "header_type": "none", "path": path,
+        "flow": ob.get("flow", ""), "encryption": "none",
+        "network": network, "header_type": "none", "path": path, "xhttp_extra": {},
         "host": host or (tr.get("headers") or {}).get("Host", ""),
         "service_name": tr.get("service_name", ""), "mode": "",
         "security": "reality" if reality.get("enabled") else "tls" if tls.get("enabled") else "none",
@@ -81,7 +81,8 @@ def _model_from_xray(ob: Dict[str, Any]) -> Dict[str, Any]:
         "uuid": user.get("id", ""), "password": user.get("password", ""), "method": user.get("method", ""),
         "plugin": "", "plugin_opts": "",
         "alter_id": int(user.get("alterId") or 0), "vmess_security": user.get("security", "auto"),
-        "flow": user.get("flow", ""),
+        "flow": user.get("flow", ""), "encryption": user.get("encryption", "none") if protocol == "vless" else "none",
+        "xhttp_extra": (net_settings.get("extra") or {}) if network == "xhttp" else {},
         "network": network, "header_type": tcp_header.get("type", "none"),
         "path": net_settings.get("path", "/"), "host": host,
         "service_name": net_settings.get("serviceName", ""),
@@ -185,6 +186,8 @@ def singbox_outbound(node: Dict[str, Any], tag: str) -> Dict[str, Any]:
             out.update({"plugin": m["plugin"], "plugin_opts": m.get("plugin_opts", "")})
         return out
     if m["type"] == "vless":
+        if (m.get("encryption") or "none") != "none":
+            raise ValueError("VLESS Encryption (encryption=mlkem768x25519plus...) only works on Xray; switch the core to Xray")
         out.update({"uuid": m["uuid"], "packet_encoding": "xudp"})
         if m.get("flow"):
             out["flow"] = m["flow"]
@@ -245,6 +248,8 @@ def _xray_stream(m: Dict[str, Any]) -> Dict[str, Any]:
         st["httpupgradeSettings"] = {"path": path, "host": host}
     elif net == "xhttp":
         st["xhttpSettings"] = {"path": path, "host": host, "mode": m.get("mode") or "auto"}
+        if m.get("xhttp_extra"):
+            st["xhttpSettings"]["extra"] = m["xhttp_extra"]
     elif net == "h2":
         raise ValueError("Xray removed the HTTP/2 (h2) transport; switch the core to sing-box or use xhttp")
     else:
@@ -267,7 +272,7 @@ def xray_outbound(node: Dict[str, Any], tag: str) -> Dict[str, Any]:
     if m["type"] in ("vless", "vmess"):
         user: Dict[str, Any] = {"id": m["uuid"]}
         if m["type"] == "vless":
-            user["encryption"] = "none"
+            user["encryption"] = m.get("encryption") or "none"  # "none" or Xray VLESS Encryption
             if m.get("flow"):
                 user["flow"] = m["flow"]
         else:

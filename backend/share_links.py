@@ -10,9 +10,11 @@ source of truth instead of translating one core's field names into the other's:
     method          shadowsocks        plugin, plugin_opts   shadowsocks (SIP003)
     alter_id, vmess_security           vmess
     flow            vless (e.g. xtls-rprx-vision)
+    encryption      vless: "none" or Xray VLESS Encryption (e.g. mlkem768x25519plus.native.0rtt.<key>)
     network         tcp | ws | grpc | h2 | httpupgrade | xhttp | kcp | quic
     header_type     none | http (TCP HTTP-header obfuscation)
     path, host, service_name, mode     transport details (mode: grpc gun/multi, xhttp mode)
+    xhttp_extra     dict: the link's xhttp "extra" JSON (padding, xmux, ...), passed to Xray as-is
     security        none | tls | reality
     sni, alpn (list), fingerprint, insecure (bool), pinned_cert_sha256 (Xray's replacement for insecure)
     reality_public_key, reality_short_id, reality_spider_x
@@ -50,6 +52,14 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes")
 
 
+def _json_param(value: str) -> Dict[str, Any]:
+    try:
+        data = json.loads(value) if value else {}
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _split_list(value: str) -> List[str]:
     return [v.strip() for v in (value or "").split(",") if v.strip()]
 
@@ -80,6 +90,7 @@ def _transport_and_tls(params: Dict[str, List[str]], default_security: str = "no
         "host": _first(params, "host"),
         "service_name": _first(params, "serviceName", "path") if network == "grpc" else "",
         "mode": _first(params, "mode"),
+        "xhttp_extra": _json_param(_first(params, "extra")) if network == "xhttp" else {},
         "security": security or "none",
         "sni": _first(params, "sni", "peer"),
         "alpn": _split_list(_first(params, "alpn")),
@@ -114,6 +125,7 @@ def parse_vless(link: str) -> Optional[Dict[str, Any]]:
         return {
             "type": "vless", "raw": link, "remark": remark, "server": host, "server_port": port,
             "uuid": uuid, "flow": _first(params, "flow"),
+            "encryption": _first(params, "encryption", default="none"),
             **_transport_and_tls(params),
         }
     except (ValueError, IndexError):
